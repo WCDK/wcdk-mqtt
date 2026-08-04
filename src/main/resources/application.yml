@@ -1,0 +1,108 @@
+server:
+  port: 38082
+  servlet:
+    encoding:
+      charset: UTF-8
+      enabled: true
+      force: true
+
+spring:
+  autoconfigure:
+    exclude:
+      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
+      - org.springframework.boot.autoconfigure.r2dbc.R2dbcAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.r2dbc.R2dbcDataAutoConfiguration
+      - org.springframework.boot.autoconfigure.data.r2dbc.R2dbcRepositoriesAutoConfiguration
+  main:
+    banner-mode: off
+    web-application-type: reactive
+  application:
+    name: wcdk-mqtt-service
+knife4j:
+  enable: true
+
+springdoc:
+  api-docs:
+    enabled: true
+  swagger-ui:
+    enabled: true
+
+wcdk:
+  iot:
+    swagger:
+      title: wcdk-mqtt-service 接口文档
+      description: wcdk-mqtt-service MQTT 服务接口文档
+      version: 1.0
+    r2dbc:
+      enabled: false
+    mqtt:
+      broker:
+        enabled: true
+        boss-threads: 1       # 0=默认1，>0使用配置值
+        worker-threads: 0     # 0=默认CPU×2，>0使用配置值                                                                                                                                          ⬖ Getting started                ✕
+        backlog: 1024         # 默认128
+        host: 0.0.0.0
+        port: 1883
+        max-payload-size: 1048576
+        max-client-id-length: 128
+        anonymous: true
+        username: admin  # HTTP API 和控制台登录用户名
+        password: wcdk@2026  # HTTP API 和控制台登录密码
+        retained-messages: true
+        persistence: true
+        delivery-ack-enabled: true  # 是否启用集群消息投递确认（ACK）
+        client-ack-enabled: true  # 是否启用客户端消息确认（ACK）
+        cluster: # 集群配置 主从模式
+          enabled: true
+          heartbeat-interval-millis: 1000
+          node-timeout-millis: 10000
+          node-id: mqtt-master-1
+          role: MASTER  # MASTER 主节点 / SLAVE 子节点
+          channel: tcp
+          bind-host: 0.0.0.0
+          bind-port: 28883
+          global-session: false
+          load-balance:
+            enabled: true
+            include-master: false
+          username: admin  # 集群认证用户名
+          password: wcdk@2026  # 集群认证密码
+          peers:
+            - 127.0.0.1:28884
+          delivery-ack-enabled: true  # 是否启用集群消息投递确认（ACK）
+          client-ack-enabled: true  # 是否启用客户端消息确认（ACK）
+          # 子节点精简配置示例:
+          # role: SLAVE
+          # node-id: mqtt-slave-1
+          # master:
+          #   host: 192.168.1.100
+          #   port: 28883
+          #   username: admin
+          #   password: wcdk@2026
+          # 其他配置将从主节点自动同步
+
+        acl:
+          enabled: false
+          default-policy: ALLOW
+          rules:
+            - enabled: true
+              policy: DENY
+              action: PUBLISH
+              client-ids:
+                - blocked-*
+              topic-filters:
+                - wcdk/secure/#
+    influx:
+      enabled: true
+      url: http://127.0.0.1:8086
+      token:
+      org: wcdk
+      bucket: wcdk-messages
+      username: admin
+      password: wcdk@2026
+logging:
+  charset:
+    console: UTF-8
+    file: UTF-8
+  level:
+    com.wcdk.mqtt.core: info

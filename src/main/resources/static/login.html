@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>wcdk-MQTT 登录</title>
+    <link rel="stylesheet" href="/vendor/element-ui/theme-chalk/index.css">
+    <style>
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        .login-container {
+            width: 100%;
+            max-width: 400px;
+            padding: 20px;
+        }
+
+        .login-card {
+            background: #ffffff;
+            border-radius: 12px;
+            box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+            padding: 40px;
+        }
+
+        .login-header {
+            text-align: center;
+            margin-bottom: 32px;
+        }
+
+        .login-header h1 {
+            font-size: 24px;
+            font-weight: 600;
+            color: #303133;
+            margin-bottom: 8px;
+        }
+
+        .login-header p {
+            color: #909399;
+            font-size: 14px;
+        }
+
+        .login-form {
+            margin-bottom: 24px;
+        }
+
+        .login-form .el-form-item {
+            margin-bottom: 20px;
+        }
+
+        .login-button {
+            width: 100%;
+            height: 44px;
+            font-size: 16px;
+        }
+
+        .login-footer {
+            text-align: center;
+            color: #909399;
+            font-size: 12px;
+        }
+
+        .error-message {
+            color: #f56c6c;
+            font-size: 13px;
+            text-align: center;
+            margin-bottom: 16px;
+        }
+    </style>
+</head>
+<body>
+<div id="app" class="login-container" v-cloak>
+    <div class="login-card">
+        <div class="login-header">
+            <h1>wcdk-MQTT</h1>
+            <p>MQTT Broker 控制台</p>
+        </div>
+
+        <div v-if="errorMsg" class="error-message">
+            {{ errorMsg }}
+        </div>
+
+        <form class="login-form" action="/login" method="post">
+            <div class="el-form-item">
+                <label class="el-form-item__label">用户名</label>
+                <div class="el-form-item__content">
+                    <input type="text" name="username" v-model="username" class="el-input__inner" placeholder="请输入用户名" autocomplete="username" required>
+                </div>
+            </div>
+
+            <div class="el-form-item">
+                <label class="el-form-item__label">密码</label>
+                <div class="el-form-item__content">
+                    <input type="password" name="password" v-model="password" class="el-input__inner" placeholder="请输入密码" autocomplete="current-password" required>
+                </div>
+            </div>
+
+            <button type="submit" class="el-button el-button--primary login-button">登录</button>
+        </form>
+
+        <div class="login-footer">
+            <p>登录账号和密码以 wcdk-mqtt-server 的 application.yml 配置为准</p>
+        </div>
+    </div>
+</div>
+
+<script src="/vendor/vue/vue.min.js"></script>
+<script src="/vendor/element-ui/index.js"></script>
+<script>
+    new Vue({
+        el: '#app',
+        data: function () {
+            return {
+                username: '',
+                password: '',
+                errorMsg: ''
+            };
+        },
+        created: function () {
+            var urlParams = new URLSearchParams(window.location.search);
+            if (urlParams.get('error') === 'true') {
+                this.errorMsg = '用户名或密码错误';
+            }
+            if (urlParams.get('logout') === 'true') {
+                this.errorMsg = '已成功退出登录';
+            }
+            if (urlParams.get('expired') === 'true') {
+                this.errorMsg = '登录状态已失效，请重新登录';
+            }
+        }
+    });
+</script>
+</body>
+</html>
