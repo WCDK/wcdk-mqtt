@@ -77,7 +77,7 @@ wcdk:
 | --- | --- | ---: | ---: | --- |
 | `wcdk-mqtt` | MASTER | `1883` | `28883` | `mqtt-master-1` |
 | `wcdk-mqtt2` | MASTER | `1884` | `28884` | `mqtt-master-2` |
-| `wcdk-mqtt3` | SLAVE | `1885` | `28885` | `mqtt-slave-1` |
+| `wcdk-mqtt3` | WORKER | `1885` | `28885` | `mqtt-worker-1` |
 
 主节点需要互相配置 `peers`：
 
@@ -112,8 +112,8 @@ wcdk:
     broker:
       cluster:
         enabled: true
-        role: SLAVE
-        node-id: mqtt-slave-1
+        role: WORKER
+        node-id: mqtt-worker-1
         bind-host: 0.0.0.0
         bind-port: 28885
         username: admin
@@ -224,9 +224,9 @@ http://127.0.0.1:38082/doc.html
 
 ### 集群能力
 
-- MASTER 和 SLAVE 节点角色。
+- MASTER 和 WORKER 节点角色。
 - 主节点 peers 对等连接。
-- 从节点 `masters` 多主节点连接。
+- 工作节点 `masters` 多主节点连接。
 - 集群 TCP 通道认证。
 - 心跳、节点存活判断和自动重连。
 - 客户端会话归属和集群节点状态同步。

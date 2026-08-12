@@ -76,8 +76,14 @@ public class ReactorMqttBroker implements SmartLifecycle {
                             MqttBrokerClusterManager.NodeState targetNode = clusterManager == null
                                     ? null
                                     : clusterManager.selectLoadBalanceTarget().orElse(null);
+                            if (clusterManager != null && clusterManager.isClusterEnabled() && clusterManager.isMaster() && targetNode == null) {
+                                // 主节点没有可用工作节点时拒绝接入，避免主节点承载客户端会话。
+                                log.warn("主节点暂无可用工作节点，拒绝 MQTT 客户端连接，远端地址：{}", channel.remoteAddress());
+                                channel.close();
+                                return;
+                            }
                             if (targetNode != null && !clusterManager.isLocalNode(targetNode.getNodeId())) {
-                                log.info("MQTT client connection proxy target: nodeId={}, host={}, port={}, client={}",
+                                log.info("主节点将 MQTT 客户端连接路由到工作节点，节点ID：{}，地址：{}:{}，客户端地址：{}",
                                         targetNode.getNodeId(), targetNode.getMqttHost(), targetNode.getMqttPort(),
                                         channel.remoteAddress());
                                 channel.pipeline().addLast("mqttTcpProxyHandler", new MqttTcpProxyHandler(

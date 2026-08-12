@@ -8,6 +8,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
+import java.util.function.Function;
 
 import com.wcdk.mqtt.core.config.MqttBrokerProperties;
 import io.netty.bootstrap.Bootstrap;
@@ -61,6 +62,7 @@ public class MqttClusterTcpChannel {
     private final Consumer<String> messageConsumer;
     /** 配置同步服务提供者 */
     private final ObjectProvider<MqttClusterConfigSyncService> configSyncServiceProvider;
+    private final Function<String, List<String>> knownNodeStateProvider;
     /** 已连接的通道集合 */
     private final Set<io.netty.channel.Channel> channels = ConcurrentHashMap.newKeySet();
     /** 已认证的节点ID集合 */
@@ -79,10 +81,12 @@ public class MqttClusterTcpChannel {
 
     public MqttClusterTcpChannel(MqttBrokerProperties.Cluster properties, 
                                   Consumer<String> messageConsumer,
-                                  ObjectProvider<MqttClusterConfigSyncService> configSyncServiceProvider) {
+                                  ObjectProvider<MqttClusterConfigSyncService> configSyncServiceProvider,
+                                  Function<String, List<String>> knownNodeStateProvider) {
         this.properties = properties;
         this.messageConsumer = messageConsumer;
         this.configSyncServiceProvider = configSyncServiceProvider;
+        this.knownNodeStateProvider = knownNodeStateProvider;
     }
 
     /**
@@ -98,7 +102,7 @@ public class MqttClusterTcpChannel {
         startServer();
         
         // 根据节点角色决定连接策略
-        if (properties.getRole() == MqttBrokerProperties.NodeRole.SLAVE) {
+        if (properties.getRole() == MqttBrokerProperties.NodeRole.WORKER) {
             // 从节点连接主节点
             connectToMaster();
         } else {
@@ -179,8 +183,13 @@ public class MqttClusterTcpChannel {
 
     private void connectPeers() {
         List<String> peers = properties.getPeers() == null ? List.of() : properties.getPeers();
-        for (String peer : peers) {
-            connectPeer(peer);
+        for (String peerGroup : peers) {
+            if (!StringUtils.hasText(peerGroup)) {
+                continue;
+            }
+            for (String peer : peerGroup.split("[,;]")) {
+                connectPeer(peer);
+            }
         }
     }
 
@@ -399,6 +408,8 @@ public class MqttClusterTcpChannel {
             
             // 向新注册的从节点发送配置同步消息
             sendConfigSync(ctx);
+            // 将主节点当前已知的节点状态快照发送给新连接的从节点
+            sendKnownNodeStates(ctx);
         }
 
         /**
@@ -407,6 +418,15 @@ public class MqttClusterTcpChannel {
          *
          * @param ctx 通道处理器上下文
          */
+        private void sendKnownNodeStates(ChannelHandlerContext ctx) {
+            if (knownNodeStateProvider == null) {
+                return;
+            }
+            for (String payload : knownNodeStateProvider.apply(findNodeIdByChannel(ctx.channel()))) {
+                ctx.channel().writeAndFlush(Unpooled.wrappedBuffer((payload + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+            }
+        }
+
         private void sendConfigSync(ChannelHandlerContext ctx) {
             MqttClusterConfigSyncService configSyncService = configSyncServiceProvider.getIfAvailable();
             if (configSyncService != null) {

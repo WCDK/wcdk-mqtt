@@ -81,8 +81,8 @@ public class MqttBrokerProperties {
         /** 集群通信通道类型，支持TCP和GRPC */
         private Channel channel = Channel.TCP;
 
-        /** 节点角色，MASTER为从节点，SLAVE为从节点 */
-        private NodeRole role = NodeRole.SLAVE;
+        /** 节点角色，MASTER为主节点，WORKER为工作节点 */
+        private NodeRole role = NodeRole.WORKER;
 
         /** 主节点配置，从节点需要连接主节点 */
         private MasterNode master = new MasterNode();
@@ -176,8 +176,8 @@ public class MqttBrokerProperties {
     public enum NodeRole {
         /** 主节点，负责协调集群和负载均衡 */
         MASTER,
-        /** 从节点，连接主节点并同步状态 */
-        SLAVE
+        /** 工作节点，连接主节点并同步状态 */
+        WORKER
     }
 
     /**

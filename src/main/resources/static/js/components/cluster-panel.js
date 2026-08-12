@@ -97,7 +97,7 @@ Vue.component('cluster-panel', {
                             <el-descriptions-item label="监听地址">
                                 <span class="mono">{{ clusterConfig.bindHost }}:{{ clusterConfig.bindPort }}</span>
                             </el-descriptions-item>
-                            <el-descriptions-item v-if="clusterConfig.role === 'SLAVE' && clusterConfig.master" label="主节点地址">
+                            <el-descriptions-item v-if="clusterConfig.role === 'WORKER' && clusterConfig.master" label="主节点地址">
                                 <span class="mono">{{ clusterConfig.master.host }}:{{ clusterConfig.master.port }}</span>
                             </el-descriptions-item>
                             <el-descriptions-item v-if="clusterConfig.peers && clusterConfig.peers.length > 0" label="对等节点" :span="2">

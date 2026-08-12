@@ -49,7 +49,7 @@ public class MqttClusterController {
             ClusterNodeView currentNode = new ClusterNodeView();
             currentNode.setNodeId(resolveNodeId());
             currentNode.setRole(mqttBrokerProperties.getCluster() != null ? 
-                    mqttBrokerProperties.getCluster().getRole().name() : "SLAVE");
+                    mqttBrokerProperties.getCluster().getRole().name() : "WORKER");
             currentNode.setHost(mqttBrokerProperties.getHost());
             currentNode.setPort(mqttBrokerProperties.getPort());
             currentNode.setMqttHost(mqttBrokerProperties.getHost());
@@ -69,7 +69,7 @@ public class MqttClusterController {
             MqttBrokerClusterManager.NodeState state = entry.getValue();
             ClusterNodeView nodeView = new ClusterNodeView();
             nodeView.setNodeId(state.getNodeId());
-            nodeView.setRole(state.getRole() != null ? state.getRole().name() : "SLAVE");
+            nodeView.setRole(state.getRole() != null ? state.getRole().name() : "WORKER");
             nodeView.setHost(state.getHost());
             nodeView.setPort(state.getPort());
             nodeView.setMqttHost(state.getMqttHost());

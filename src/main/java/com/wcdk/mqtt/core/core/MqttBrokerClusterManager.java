@@ -112,7 +112,8 @@ public class MqttBrokerClusterManager implements SmartLifecycle {
         this.sessionRegistry = sessionRegistry;
         this.configSyncServiceProvider = configSyncServiceProvider;
         this.nodeId = resolveNodeId(properties);
-        this.role = properties.getCluster() != null ? properties.getCluster().getRole() : MqttBrokerProperties.NodeRole.SLAVE;
+        this.role = properties.getCluster() != null && properties.getCluster().getRole() != null
+                ? properties.getCluster().getRole() : MqttBrokerProperties.NodeRole.WORKER;
         this.masterNodeId = resolveMasterNodeId(properties);
     }
 
@@ -128,8 +129,8 @@ public class MqttBrokerClusterManager implements SmartLifecycle {
         return role == MqttBrokerProperties.NodeRole.MASTER;
     }
 
-    public boolean isSlave() {
-        return role == MqttBrokerProperties.NodeRole.SLAVE;
+    public boolean isWorker() {
+        return role == MqttBrokerProperties.NodeRole.WORKER;
     }
 
     public String getMasterNodeId() {
@@ -174,6 +175,7 @@ public class MqttBrokerClusterManager implements SmartLifecycle {
         boolean includeMaster = loadBalance.isIncludeMaster();
         return nodes.values().stream()
                 .filter(state -> state != null && StringUtils.hasText(state.getNodeId()))
+                .filter(state -> state.getRole() == MqttBrokerProperties.NodeRole.WORKER)
                 // 根据配置决定是否包含主节点
                 .filter(state -> includeMaster || !nodeId.equals(state.getNodeId()))
                 // 过滤掉不存活的节点
@@ -319,6 +321,11 @@ public class MqttBrokerClusterManager implements SmartLifecycle {
     }
 
     public void publish(MqttBrokerMessage message) {
+        // 主节点只负责路由消息，不承载本地 MQTT 会话。
+        if (isMaster()) {
+            publishClusterEvent(toPublishEvent(message), false, false);
+            return;
+        }
         storeRetained(message, true);
         sessionRegistry.publish(message);
         enqueueOfflineMessages(message);
@@ -391,7 +398,7 @@ public class MqttBrokerClusterManager implements SmartLifecycle {
         if (clusterProperties().getChannel() == MqttBrokerProperties.Channel.GRPC) {
             log.warn("MQTT Broker gRPC集群通道未单独配置，回退到TCP通道");
         }
-        clusterChannel = new MqttClusterTcpChannel(clusterProperties(), this::handleClusterEvent, configSyncServiceProvider);
+        clusterChannel = new MqttClusterTcpChannel(clusterProperties(), this::handleClusterEvent, configSyncServiceProvider, ignored -> nodes.values().stream().map(this::toNodeHeartbeatJson).toList());
         clusterChannel.start();
         running.set(true);
         startHeartbeat();
@@ -738,6 +745,21 @@ public class MqttBrokerClusterManager implements SmartLifecycle {
      * 定期向集群广播当前节点状态，包括主机、端口、会话数等信息
      * 其他节点收到心跳后会更新该节点的状态信息
      */
+    /**
+     * 将节点状态包装为标准集群心跳事件，供新连接节点初始化状态。
+     *
+     * @param state 节点状态
+     * @return 集群心跳事件JSON
+     */
+    private String toNodeHeartbeatJson(NodeState state) {
+        ClusterEvent event = new ClusterEvent();
+        event.setType(TYPE_NODE_HEARTBEAT);
+        event.setNodeId(state.getNodeId());
+        event.setNodeJson(JSON.toJSONString(state));
+        event.setCreatedAt(System.currentTimeMillis());
+        return JSON.toJSONString(event);
+    }
+
     private void heartbeat() {
         pruneExpiredNodes();
         // 构建当前节点状态
