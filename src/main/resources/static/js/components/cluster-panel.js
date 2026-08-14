@@ -54,12 +54,13 @@ Vue.component('cluster-panel', {
                                     <span class="mono">{{ row.host }}</span>
                                 </template>
                             </el-table-column>
-                            <el-table-column prop="port" label="端口" width="100" />
-                            <el-table-column label="MQTT 地址" min-width="180">
+                            <el-table-column prop="port" label="集群端口" width="100" />
+                            <el-table-column prop="mqttHost" label="监听地址" min-width="150">
                                 <template slot-scope="{ row }">
-                                    <span class="mono">{{ row.mqttHost || row.host }}:{{ row.mqttPort || '-' }}</span>
+                                    <span class="mono">{{ row.mqttHost || row.host || "-" }}</span>
                                 </template>
                             </el-table-column>
+                            <el-table-column prop="mqttPort" label="监听端口" width="100" />
                             <el-table-column prop="sessionCount" label="会话数" width="100" />
                             <el-table-column prop="active" label="状态" width="100">
                                 <template slot-scope="{ row }">

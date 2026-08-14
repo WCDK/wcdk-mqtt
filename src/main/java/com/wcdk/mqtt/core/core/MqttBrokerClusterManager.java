@@ -1,5 +1,8 @@
 package com.wcdk.mqtt.core.core;
 
+import java.net.InetAddress;
+import java.net.NetworkInterface;
+
 import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -159,6 +162,12 @@ public class MqttBrokerClusterManager implements SmartLifecycle {
 
     public Map<String, CopyOnWriteArrayList<OfflineMessage>> getOfflineMessages() {
         return offlineMessages;
+    }
+
+    /** ????????????????????? */
+    public void clearMessageState() {
+        offlineMessages.clear();
+        sessionSnapshots.clear();
     }
     /**
      * 选择负载均衡目标节点
@@ -398,7 +407,7 @@ public class MqttBrokerClusterManager implements SmartLifecycle {
         if (clusterProperties().getChannel() == MqttBrokerProperties.Channel.GRPC) {
             log.warn("MQTT Broker gRPC集群通道未单独配置，回退到TCP通道");
         }
-        clusterChannel = new MqttClusterTcpChannel(clusterProperties(), this::handleClusterEvent, configSyncServiceProvider, ignored -> nodes.values().stream().map(this::toNodeHeartbeatJson).toList());
+        clusterChannel = new MqttClusterTcpChannel(clusterProperties(), nodeId, this::handleClusterEvent, configSyncServiceProvider, ignored -> nodes.values().stream().map(this::toNodeHeartbeatJson).toList());
         clusterChannel.start();
         running.set(true);
         startHeartbeat();
@@ -765,7 +774,7 @@ public class MqttBrokerClusterManager implements SmartLifecycle {
         // 构建当前节点状态
         NodeState state = new NodeState();
         state.setNodeId(nodeId);
-        state.setHost(clusterProperties().getBindHost());
+        state.setHost(resolveNodeAdvertiseHost());
         state.setPort(clusterProperties().getBindPort());
         state.setMqttHost(resolveMqttAdvertiseHost());
         state.setMqttPort(properties.getPort());
@@ -911,6 +920,7 @@ public class MqttBrokerClusterManager implements SmartLifecycle {
         ClusterEvent event = new ClusterEvent();
         event.setType(type);
         event.setNodeId(nodeId);
+        event.setMessageId(message.getMessageId());
         event.setTopic(message.getTopic());
         event.setPayload(Base64.getEncoder().encodeToString(message.payload()));
         event.setQos(message.getQos().value());
@@ -946,7 +956,7 @@ public class MqttBrokerClusterManager implements SmartLifecycle {
         byte[] payload = StringUtils.hasText(event.getPayload())
                 ? Base64.getDecoder().decode(event.getPayload())
                 : new byte[0];
-        return new MqttBrokerMessage(event.getTopic(), payload, MqttQoS.valueOf(event.getQos()), event.isRetained());
+        return new MqttBrokerMessage(event.getTopic(), payload, MqttQoS.valueOf(event.getQos()), event.isRetained(), event.getMessageId());
     }
 
     private RetainedMessage toRetainedMessage(ClusterEvent event) {
@@ -997,14 +1007,46 @@ public class MqttBrokerClusterManager implements SmartLifecycle {
         return isNodeAlive(owner) ? owner : null;
     }
 
-    private String resolveMqttAdvertiseHost() {
-        String host = properties.getHost();
-        if (!StringUtils.hasText(host) || "0.0.0.0".equals(host) || "::".equals(host)) {
-            return clusterProperties().getBindHost();
-        }
-        return host;
+    /**
+     * 解析节点对外公布的实际主机地址。
+     *
+     * @return 节点实际IP地址
+     */
+    private String resolveNodeAdvertiseHost() {
+        return resolveAdvertiseHost(clusterProperties().getBindHost());
     }
 
+    private String resolveMqttAdvertiseHost() {
+        return resolveAdvertiseHost(properties.getHost());
+    }
+
+    private String resolveAdvertiseHost(String configuredHost) {
+        if (StringUtils.hasText(configuredHost)) {
+            String host = configuredHost.trim();
+            if (!"0.0.0.0".equals(host) && !"::".equals(host)) {
+                return host;
+            }
+        }
+        try {
+            InetAddress localAddress = InetAddress.getLocalHost();
+            if (!localAddress.isLoopbackAddress() && !localAddress.isAnyLocalAddress()) {
+                return localAddress.getHostAddress();
+            }
+            var interfaces = NetworkInterface.getNetworkInterfaces();
+            while (interfaces != null && interfaces.hasMoreElements()) {
+                var addresses = interfaces.nextElement().getInetAddresses();
+                while (addresses.hasMoreElements()) {
+                    InetAddress address = addresses.nextElement();
+                    if (!address.isLoopbackAddress() && !address.isAnyLocalAddress() && !address.isLinkLocalAddress()) {
+                        return address.getHostAddress();
+                    }
+                }
+            }
+        } catch (Exception ex) {
+            log.warn("无法解析节点实际可达地址，configuredHost={}", configuredHost, ex);
+        }
+        return "127.0.0.1";
+    }
     private long nodeTimeoutMillis() {
         long heartbeatInterval = Math.max(1, clusterProperties().getHeartbeatIntervalMillis());
         long configuredTimeout = Math.max(1, clusterProperties().getNodeTimeoutMillis());
@@ -1027,17 +1069,17 @@ public class MqttBrokerClusterManager implements SmartLifecycle {
     }
 
     private static String resolveMasterNodeId(MqttBrokerProperties properties) {
-        if (properties.getCluster() == null || properties.getCluster().getMaster() == null) {
+        if (properties.getCluster() == null || !StringUtils.hasText(properties.getCluster().getMaster())) {
             return null;
         }
-        MqttBrokerProperties.MasterNode master = properties.getCluster().getMaster();
-        if (!StringUtils.hasText(master.getHost())) {
-            return null;
-        }
-        return master.getHost() + ":" + master.getPort();
+        return properties.getCluster().getMaster().split("[,;]")[0].trim();
     }
 
     private interface ClusterMessage {
+
+        default String getMessageId() {
+            return null;
+        }
 
         String getTopic();
 
@@ -1058,6 +1100,8 @@ public class MqttBrokerClusterManager implements SmartLifecycle {
         private String requestId;
 
         private String targetNodeId;
+
+        private String messageId;
 
         private String topic;
 

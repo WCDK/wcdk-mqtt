@@ -28,6 +28,8 @@ public class InfluxDbUtil {
 
     private final InfluxProperties properties;
 
+    private final WriteApi writeApi;
+
     private final WriteApiBlocking writeApiBlocking;
 
     private final QueryApi queryApi;
@@ -39,12 +41,14 @@ public class InfluxDbUtil {
     private final OrganizationsApi organizationsApi;
 
     public InfluxDbUtil(InfluxProperties properties,
+                        WriteApi writeApi,
                         WriteApiBlocking writeApiBlocking,
                         QueryApi queryApi,
                         DeleteApi deleteApi,
                         BucketsApi bucketsApi,
                         OrganizationsApi organizationsApi) {
         this.properties = properties;
+        this.writeApi = writeApi;
         this.writeApiBlocking = writeApiBlocking;
         this.queryApi = queryApi;
         this.deleteApi = deleteApi;
@@ -155,6 +159,14 @@ public class InfluxDbUtil {
             return;
         }
         writeApiBlocking.writePoint(point);
+    }
+
+    public void writePointAsync(Point point) {
+        if (hasExplicitTarget()) {
+            writeApi.writePoint(properties.getBucket(), properties.getOrg(), point);
+            return;
+        }
+        writeApi.writePoint(point);
     }
 
     public void writePoints(List<Point> points) {

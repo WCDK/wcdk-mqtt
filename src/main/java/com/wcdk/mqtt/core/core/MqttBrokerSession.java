@@ -37,6 +37,7 @@ public class MqttBrokerSession {
     private volatile MqttBrokerMessage willMessage;
     private final Map<String, MqttQoS> subscriptions = new ConcurrentHashMap<>();
     private final Map<Integer, MqttBrokerMessage> inboundQos2 = new ConcurrentHashMap<>();
+    private final Map<Integer, Boolean> inboundQos1 = new ConcurrentHashMap<>();
     private final Map<Integer, OutboundPendingMessage> outboundPendingMessages = new ConcurrentHashMap<>();
     /** 集群确认上下文映射，存储等待集群确认的消息包ID和确认信息 */
     private final Map<Integer, ClusterAckContext> clusterAckContexts = new ConcurrentHashMap<>();
@@ -149,6 +150,14 @@ public class MqttBrokerSession {
 
     public MqttBrokerMessage removeInboundQos2(int packetId) {
         return inboundQos2.remove(packetId);
+    }
+
+    public synchronized boolean isDuplicateInboundQos1(int packetId, boolean duplicateFlag) {
+        if (duplicateFlag && inboundQos1.containsKey(packetId)) {
+            return true;
+        }
+        inboundQos1.put(packetId, Boolean.TRUE);
+        return false;
     }
 
     public synchronized ClusterAckContext confirmOutboundQos1(int packetId) {
@@ -339,6 +348,15 @@ public class MqttBrokerSession {
 
     public int queuedPublishCount() {
         return queuedPublishMessages.size();
+    }
+
+    /** ??????????????????? */
+    public synchronized void clearMessageState() {
+        inboundQos1.clear();
+        inboundQos2.clear();
+        outboundPendingMessages.clear();
+        clusterAckContexts.clear();
+        queuedPublishMessages.clear();
     }
 
     private int nextPacketId() {

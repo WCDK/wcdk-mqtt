@@ -25,6 +25,7 @@ import org.slf4j.LoggerFactory;
 public class MqttTcpProxyHandler extends ChannelInboundHandlerAdapter {
 
     private static final Logger log = LoggerFactory.getLogger(MqttTcpProxyHandler.class);
+    private static final int CONNECT_TIMEOUT_MILLIS = 5000;
 
     private final String targetNodeId;
     private final String targetHost;
@@ -45,6 +46,7 @@ public class MqttTcpProxyHandler extends ChannelInboundHandlerAdapter {
         Bootstrap bootstrap = new Bootstrap()
                 .group(inboundChannel.eventLoop())
                 .channel(NioSocketChannel.class)
+                .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, CONNECT_TIMEOUT_MILLIS)
                 .option(ChannelOption.AUTO_READ, false)
                 .handler(new ChannelInitializer<SocketChannel>() {
                     @Override

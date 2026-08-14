@@ -66,7 +66,210 @@ wcdk:
       retained-messages: true
       persistence: true
 ```
+```yaml
+version: '3.8'
 
+services:
+  mqtt-master-1:
+    image: wcdk-mqtt:1.0.0
+    container_name: mqtt-master-1
+    hostname: mqtt-master-1
+    ports:
+      - "38082:38082"
+      - "1883:1883"
+      - "28883:28883"
+    environment:
+      SERVER_PORT: "38082"
+      MQTT_BROKER_PORT: "1883"
+      MQTT_USERNAME: "admin"
+      MQTT_PASSWORD: "wcdk@2026"
+      MQTT_CLUSTER_ENABLED: "true"
+      MQTT_CLUSTER_NODE_ID: "mqtt-master-1"
+      MQTT_CLUSTER_ROLE: "MASTER"
+      MQTT_CLUSTER_CHANNEL: "tcp"
+      MQTT_CLUSTER_BIND_HOST: "0.0.0.0"
+      MQTT_CLUSTER_BIND_PORT: "28883"
+      MQTT_CLUSTER_HEARTBEAT_INTERVAL: "1000"
+      MQTT_CLUSTER_NODE_TIMEOUT: "10000"
+      MQTT_CLUSTER_GLOBAL_SESSION: "false"
+      MQTT_CLUSTER_LOAD_BALANCE_ENABLED: "true"
+      MQTT_CLUSTER_LOAD_BALANCE_INCLUDE_MASTER: "false"
+      MQTT_CLUSTER_USERNAME: "admin"
+      MQTT_CLUSTER_PASSWORD: "wcdk@2026"
+      MQTT_CLUSTER_DELIVERY_ACK_ENABLED: "true"
+      MQTT_CLUSTER_CLIENT_ACK_ENABLED: "true"
+      MQTT_CLUSTER_PEERS: "mqtt-master-2:28883"
+      INFLUX_ENABLED: "true"
+      INFLUX_URL: "http://influxdb:8086"
+      INFLUX_TOKEN: ""
+      INFLUX_ORG: "wcdk"
+      INFLUX_BUCKET: "wcdk-messages"
+      INFLUX_USERNAME: "admin"
+      INFLUX_PASSWORD: "wcdk@2026"
+    networks:
+      mqtt-cluster:
+        ipv4_address: 172.20.0.10
+    restart: unless-stopped
+
+  mqtt-master-2:
+    image: wcdk-mqtt:1.0.0
+    container_name: mqtt-master-2
+    hostname: mqtt-master-2
+    ports:
+      - "38092:38082"
+      - "1884:1883"
+      - "28884:28883"
+    environment:
+      SERVER_PORT: "38082"
+      MQTT_BROKER_PORT: "1883"
+      MQTT_USERNAME: "admin"
+      MQTT_PASSWORD: "wcdk@2026"
+      MQTT_CLUSTER_ENABLED: "true"
+      MQTT_CLUSTER_NODE_ID: "mqtt-master-2"
+      MQTT_CLUSTER_ROLE: "MASTER"
+      MQTT_CLUSTER_CHANNEL: "tcp"
+      MQTT_CLUSTER_BIND_HOST: "0.0.0.0"
+      MQTT_CLUSTER_BIND_PORT: "28883"
+      MQTT_CLUSTER_HEARTBEAT_INTERVAL: "1000"
+      MQTT_CLUSTER_NODE_TIMEOUT: "10000"
+      MQTT_CLUSTER_GLOBAL_SESSION: "false"
+      MQTT_CLUSTER_LOAD_BALANCE_ENABLED: "true"
+      MQTT_CLUSTER_LOAD_BALANCE_INCLUDE_MASTER: "false"
+      MQTT_CLUSTER_USERNAME: "admin"
+      MQTT_CLUSTER_PASSWORD: "wcdk@2026"
+      MQTT_CLUSTER_DELIVERY_ACK_ENABLED: "true"
+      MQTT_CLUSTER_CLIENT_ACK_ENABLED: "true"
+      MQTT_CLUSTER_PEERS: "mqtt-master-1:28883"
+      INFLUX_ENABLED: "true"
+      INFLUX_URL: "http://influxdb:8086"
+      INFLUX_TOKEN: ""
+      INFLUX_ORG: "wcdk"
+      INFLUX_BUCKET: "wcdk-messages"
+      INFLUX_USERNAME: "admin"
+      INFLUX_PASSWORD: "wcdk@2026"
+    networks:
+      mqtt-cluster:
+        ipv4_address: 172.20.0.11
+    restart: unless-stopped
+
+
+  mqtt-worker-1:
+    image: wcdk-mqtt:1.0.0
+    container_name: mqtt-worker-1
+    hostname: mqtt-worker-1
+    ports:
+      - "39082:38082"
+      - "1903:1883"
+      - "28886:28883"
+    environment:
+      SERVER_PORT: "38082"
+      MQTT_BROKER_PORT: "1883"
+      MQTT_USERNAME: "admin"
+      MQTT_PASSWORD: "wcdk@2026"
+      MQTT_CLUSTER_ENABLED: "true"
+      MQTT_CLUSTER_NODE_ID: "mqtt-worker-1"
+      MQTT_CLUSTER_ROLE: "WORKER"
+      MQTT_CLUSTER_CHANNEL: "tcp"
+      MQTT_CLUSTER_BIND_HOST: "0.0.0.0"
+      MQTT_CLUSTER_BIND_PORT: "28883"
+      MQTT_CLUSTER_HEARTBEAT_INTERVAL: "1000"
+      MQTT_CLUSTER_NODE_TIMEOUT: "10000"
+      MQTT_CLUSTER_GLOBAL_SESSION: "false"
+      MQTT_CLUSTER_LOAD_BALANCE_ENABLED: "true"
+      MQTT_CLUSTER_LOAD_BALANCE_INCLUDE_MASTER: "false"
+      MQTT_CLUSTER_MASTER: "mqtt-master-1:28883,mqtt-master-2:28883"
+      MQTT_CLUSTER_USERNAME: "admin"
+      MQTT_CLUSTER_PASSWORD: "wcdk@2026"
+      MQTT_CLUSTER_DELIVERY_ACK_ENABLED: "true"
+      MQTT_CLUSTER_CLIENT_ACK_ENABLED: "true"
+      INFLUX_ENABLED: "true"
+      INFLUX_URL: "http://influxdb:8086"
+      INFLUX_TOKEN: ""
+      INFLUX_ORG: "wcdk"
+      INFLUX_BUCKET: "wcdk-messages"
+      INFLUX_USERNAME: "admin"
+      INFLUX_PASSWORD: "wcdk@2026"
+    networks:
+      mqtt-cluster:
+        ipv4_address: 172.20.0.13
+    restart: unless-stopped
+
+  mqtt-worker-2:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: wcdk-mqtt:1.0.0
+    container_name: mqtt-worker-2
+    hostname: mqtt-worker-2
+    ports:
+      - "39092:38082"
+      - "1913:1883"
+      - "28887:28883"
+    environment:
+      SERVER_PORT: "38082"
+      MQTT_BROKER_PORT: "1883"
+      MQTT_USERNAME: "admin"
+      MQTT_PASSWORD: "wcdk@2026"
+      MQTT_CLUSTER_ENABLED: "true"
+      MQTT_CLUSTER_NODE_ID: "mqtt-worker-2"
+      MQTT_CLUSTER_ROLE: "WORKER"
+      MQTT_CLUSTER_CHANNEL: "tcp"
+      MQTT_CLUSTER_BIND_HOST: "0.0.0.0"
+      MQTT_CLUSTER_BIND_PORT: "28883"
+      MQTT_CLUSTER_HEARTBEAT_INTERVAL: "1000"
+      MQTT_CLUSTER_NODE_TIMEOUT: "10000"
+      MQTT_CLUSTER_GLOBAL_SESSION: "false"
+      MQTT_CLUSTER_LOAD_BALANCE_ENABLED: "true"
+      MQTT_CLUSTER_LOAD_BALANCE_INCLUDE_MASTER: "false"
+      MQTT_CLUSTER_MASTER: "mqtt-master-1:28883,mqtt-master-2:28883"
+      MQTT_CLUSTER_USERNAME: "admin"
+      MQTT_CLUSTER_PASSWORD: "wcdk@2026"
+      MQTT_CLUSTER_DELIVERY_ACK_ENABLED: "true"
+      MQTT_CLUSTER_CLIENT_ACK_ENABLED: "true"
+      INFLUX_ENABLED: "true"
+      INFLUX_URL: "http://influxdb:8086"
+      INFLUX_TOKEN: ""
+      INFLUX_ORG: "wcdk"
+      INFLUX_BUCKET: "wcdk-messages"
+      INFLUX_USERNAME: "admin"
+      INFLUX_PASSWORD: "wcdk@2026"
+    networks:
+      mqtt-cluster:
+        ipv4_address: 172.20.0.14
+    restart: unless-stopped
+
+  influxdb:
+    image: influxdb:2.9
+    container_name: mqtt-influxdb
+    ports:
+      - "38086:8086"
+    environment:
+      DOCKER_INFLUXDB_INIT_MODE: setup
+      DOCKER_INFLUXDB_INIT_USERNAME: admin
+      DOCKER_INFLUXDB_INIT_PASSWORD: wcdk@2026
+      DOCKER_INFLUXDB_INIT_ORG: wcdk
+      DOCKER_INFLUXDB_INIT_BUCKET: wcdk-messages
+    volumes:
+      - influxdb-data:/var/lib/influxdb2
+    networks:
+      mqtt-cluster:
+    restart: unless-stopped
+
+volumes:
+  influxdb-data:
+networks:
+  mqtt-cluster:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/24
+
+
+
+
+
+
+```
 客户端使用 `tcp://127.0.0.1:1883` 连接，认证信息为 `admin / wcdk@2026`。
 
 ### 两主一从集群

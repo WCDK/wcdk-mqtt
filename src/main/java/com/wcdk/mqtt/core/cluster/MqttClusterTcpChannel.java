@@ -47,6 +47,8 @@ public class MqttClusterTcpChannel {
     private static final String AUTH_OK = "AUTH_OK";
     /** 认证失败响应 */
     private static final String AUTH_FAIL = "AUTH_FAIL";
+    /** 节点注册成功响应 */
+    private static final String REGISTER_OK = "REGISTER_OK";
     /** 注册消息前缀 */
     private static final String REGISTER_PREFIX = "REGISTER:";
     /** 心跳消息前缀 */
@@ -58,6 +60,8 @@ public class MqttClusterTcpChannel {
 
     /** 集群连接配置属性 */
     private final MqttBrokerProperties.Cluster properties;
+    /** 当前节点最终解析后的唯一标识。 */
+    private final String nodeId;
     /** 消息消费者，用于处理接收到的集群消息 */
     private final Consumer<String> messageConsumer;
     /** 配置同步服务提供者 */
@@ -67,6 +71,8 @@ public class MqttClusterTcpChannel {
     private final Set<io.netty.channel.Channel> channels = ConcurrentHashMap.newKeySet();
     /** 已认证的节点ID集合 */
     private final Set<String> authenticatedNodes = ConcurrentHashMap.newKeySet();
+    /** 已完成认证但尚未完成节点注册的连接 */
+    private final Set<io.netty.channel.ChannelId> authenticatedChannels = ConcurrentHashMap.newKeySet();
     /** 通道对应的已注册节点ID */
     private final Map<io.netty.channel.ChannelId, String> nodeIdsByChannel = new ConcurrentHashMap<>();
     /** 客户端通道对应的连接目标 */
@@ -80,10 +86,12 @@ public class MqttClusterTcpChannel {
     private io.netty.channel.Channel serverChannel;
 
     public MqttClusterTcpChannel(MqttBrokerProperties.Cluster properties, 
+                                  String nodeId,
                                   Consumer<String> messageConsumer,
                                   ObjectProvider<MqttClusterConfigSyncService> configSyncServiceProvider,
                                   Function<String, List<String>> knownNodeStateProvider) {
         this.properties = properties;
+        this.nodeId = nodeId;
         this.messageConsumer = messageConsumer;
         this.configSyncServiceProvider = configSyncServiceProvider;
         this.knownNodeStateProvider = knownNodeStateProvider;
@@ -137,6 +145,7 @@ public class MqttClusterTcpChannel {
         }
         channels.clear();
         authenticatedNodes.clear();
+        authenticatedChannels.clear();
         nodeIdsByChannel.clear();
         targetsByChannel.clear();
         reconnectingTargets.clear();
@@ -162,23 +171,28 @@ public class MqttClusterTcpChannel {
     }
 
     private void connectToMaster() {
-        List<MqttBrokerProperties.MasterNode> masters = properties.getMasters();
-        if (masters != null && !masters.isEmpty()) {
-            for (MqttBrokerProperties.MasterNode master : masters) {
-                connectToMaster(master);
+        String masterConfig = properties.getMaster();
+        if (StringUtils.hasText(masterConfig)) {
+            for (String address : masterConfig.split("[,;]")) {
+                connectToMaster(address.trim());
             }
             return;
         }
-
-        connectToMaster(properties.getMaster());
+        log.warn("MQTT Broker master node configuration is empty");
     }
 
-    private void connectToMaster(MqttBrokerProperties.MasterNode master) {
-        if (master == null || !StringUtils.hasText(master.getHost())) {
-            log.warn("MQTT Broker master node configuration is empty");
+    private void connectToMaster(String address) {
+        String[] hostAndPort = address.split(":", 2);
+        if (hostAndPort.length != 2 || !StringUtils.hasText(hostAndPort[0])) {
+            log.warn("MQTT Broker master node configuration is invalid: {}", address);
             return;
         }
-        connectToNode(new ConnectionTarget(master.getHost(), master.getPort(), master.getUsername(), master.getPassword()));
+        try {
+            int port = Integer.parseInt(hostAndPort[1].trim());
+            connectToNode(new ConnectionTarget(hostAndPort[0].trim(), port, properties.getUsername(), properties.getPassword()));
+        } catch (NumberFormatException ex) {
+            log.warn("MQTT Broker master node port is invalid: {}", address);
+        }
     }
 
     private void connectPeers() {
@@ -304,6 +318,7 @@ public class MqttClusterTcpChannel {
             channels.remove(ctx.channel());
             String nodeId = findNodeIdByChannel(ctx.channel());
             nodeIdsByChannel.remove(ctx.channel().id());
+            authenticatedChannels.remove(ctx.channel().id());
             if (nodeId != null) {
                 authenticatedNodes.remove(nodeId);
                 log.info("集群节点已断开连接: {}", nodeId);
@@ -343,15 +358,14 @@ public class MqttClusterTcpChannel {
                 return;
             }
             
-            // 处理心跳消息：节点状态同步
+            // 兼容旧版本心跳前缀，但统一交给标准集群事件 JSON 解析。
             if (trimmedMessage.startsWith(HEARTBEAT_PREFIX)) {
-                handleHeartbeatMessage(ctx, trimmedMessage);
-                return;
+                trimmedMessage = trimmedMessage.substring(HEARTBEAT_PREFIX.length()).trim();
             }
             
             // 处理业务消息：仅转发已认证节点的消息
             String nodeId = findNodeIdByChannel(ctx.channel());
-            if (nodeId != null && authenticatedNodes.contains(nodeId)) {
+            if (nodeId != null && authenticatedNodes.contains(nodeId) && nodeIdsByChannel.containsKey(ctx.channel().id())) {
                 relayFromMaster(ctx.channel(), trimmedMessage);
                 messageConsumer.accept(trimmedMessage);
             }
@@ -377,6 +391,7 @@ public class MqttClusterTcpChannel {
             
             // 验证用户名密码
             if (authenticateUser(username, password)) {
+                authenticatedChannels.add(ctx.channel().id());
                 sendResponse(ctx, AUTH_OK);
                 log.info("集群节点认证成功，来源: {}", ctx.channel().remoteAddress());
             } else {
@@ -401,6 +416,10 @@ public class MqttClusterTcpChannel {
             }
             
             // 记录已连接通道和已认证节点
+            if (!authenticatedChannels.contains(ctx.channel().id())) {
+                log.warn("节点尚未完成认证，拒绝注册，节点ID：{}", nodeId);
+                return;
+            }
             channels.add(ctx.channel());
             authenticatedNodes.add(nodeId);
             nodeIdsByChannel.put(ctx.channel().id(), nodeId);
@@ -410,6 +429,7 @@ public class MqttClusterTcpChannel {
             sendConfigSync(ctx);
             // 将主节点当前已知的节点状态快照发送给新连接的从节点
             sendKnownNodeStates(ctx);
+            sendResponse(ctx, REGISTER_OK);
         }
 
         /**
@@ -467,6 +487,7 @@ public class MqttClusterTcpChannel {
 
         private final ConnectionTarget target;
         private boolean authenticated = false;
+        private boolean registered = false;
 
         public ClientAuthHandler(ConnectionTarget target) {
             this.target = target;
@@ -485,6 +506,7 @@ public class MqttClusterTcpChannel {
             channels.remove(ctx.channel());
             targetsByChannel.remove(ctx.channel().id());
             authenticated = false;
+            registered = false;
             scheduleReconnect(target);
         }
 
@@ -508,18 +530,29 @@ public class MqttClusterTcpChannel {
             }
             
             String trimmedMessage = message.trim();
+            // 兼容旧版本心跳前缀，统一交给标准集群事件 JSON 解析。
+            if (trimmedMessage.startsWith(HEARTBEAT_PREFIX)) {
+                trimmedMessage = trimmedMessage.substring(HEARTBEAT_PREFIX.length()).trim();
+            }
             
             // 处理认证成功响应
             if (AUTH_OK.equals(trimmedMessage)) {
                 authenticated = true;
-                channels.add(ctx.channel());
                 // 发送注册消息到主节点
-                String registerMessage = REGISTER_PREFIX + properties.getNodeId();
+                String registerMessage = REGISTER_PREFIX + nodeId;
                 ctx.channel().writeAndFlush(Unpooled.wrappedBuffer((registerMessage + "\n").getBytes(java.nio.charset.StandardCharsets.UTF_8)));
-                log.info("已通过主节点认证，注册为: {}", properties.getNodeId());
+                log.info("已通过主节点认证，等待节点注册确认，节点ID：{}", nodeId);
                 return;
             }
             
+            // 处理节点注册成功响应
+            if (REGISTER_OK.equals(trimmedMessage)) {
+                registered = true;
+                channels.add(ctx.channel());
+                log.info("节点注册成功，节点ID：{}", nodeId);
+                return;
+            }
+
             // 处理认证失败响应
             if (AUTH_FAIL.equals(trimmedMessage)) {
                 log.error("主节点认证失败");
@@ -539,7 +572,7 @@ public class MqttClusterTcpChannel {
             }
             
             // 转发其他业务消息给消息消费者
-            if (authenticated) {
+            if (authenticated && registered) {
                 messageConsumer.accept(trimmedMessage);
             }
         }
@@ -564,10 +597,33 @@ public class MqttClusterTcpChannel {
         }
     }
 
-    private record ConnectionTarget(String host, int port, String username, String password) {
+    private static final class ConnectionTarget {
+        private final String host;
+        private final int port;
+        private final String username;
+        private final String password;
 
-        private ConnectionTarget {
-            host = host == null ? null : host.trim();
+        ConnectionTarget(String host, int port, String username, String password) {
+            this.host = host == null ? null : host.trim();
+            this.port = port;
+            this.username = username;
+            this.password = password;
+        }
+
+        String host() {
+            return host;
+        }
+
+        int port() {
+            return port;
+        }
+
+        String username() {
+            return username;
+        }
+
+        String password() {
+            return password;
         }
 
         @Override

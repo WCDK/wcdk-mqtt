@@ -85,10 +85,10 @@ public class MqttBrokerProperties {
         private NodeRole role = NodeRole.WORKER;
 
         /** 主节点配置，从节点需要连接主节点 */
-        private MasterNode master = new MasterNode();
+        private String master;
 
         /** 多个主节点地址，从节点会分别建立集群连接 */
-        private List<MasterNode> masters = new ArrayList<>();
+
 
         /** 集群通信绑定地址 */
         private String bindHost = "0.0.0.0";

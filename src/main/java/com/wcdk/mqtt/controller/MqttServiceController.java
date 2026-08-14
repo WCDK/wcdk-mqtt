@@ -15,6 +15,7 @@ import java.util.Map;
 import java.util.Objects;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.influxdb.exceptions.UnauthorizedException;
 import com.influxdb.query.FluxRecord;
 import com.influxdb.query.FluxTable;
 import com.wcdk.mqtt.bean.ClientSession;
@@ -252,17 +253,22 @@ public class MqttServiceController {
                     pageNo,
                     pageSize);
         }
-        return queryMessagesFromInflux(
-                influxDbUtil,
-                influxProperties,
-                topicFilter,
-                qos,
-                sentFromInstant,
-                sentToInstant,
-                sortBy,
-                sortDirection,
-                pageNo,
-                pageSize);
+        try {
+            return queryMessagesFromInflux(
+                    influxDbUtil,
+                    influxProperties,
+                    topicFilter,
+                    qos,
+                    sentFromInstant,
+                    sentToInstant,
+                    sortBy,
+                    sortDirection,
+                    pageNo,
+                    pageSize);
+        } catch (UnauthorizedException ex) {
+            throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,
+                    "InfluxDB Token 无效或缺少 bucket 的读取权限，请检查 INFLUX_TOKEN、INFLUX_ORG 和 INFLUX_BUCKET", ex);
+        }
     }
 
     @DeleteMapping("/messages/list")
@@ -317,6 +323,11 @@ public class MqttServiceController {
     @Operation(summary = "清空测试消息", description = "清空测试队列中已缓存的 MQTT 消息")
     public void clearMessages() {
         mqttQueue.clearMessages();
+        sessionRegistry.sessions().forEach(MqttBrokerSession::clearMessageState);
+        MqttBrokerClusterManager clusterManager = clusterManagerProvider.getIfAvailable();
+        if (clusterManager != null) {
+            clusterManager.clearMessageState();
+        }
     }
 
     @GetMapping("/overview")

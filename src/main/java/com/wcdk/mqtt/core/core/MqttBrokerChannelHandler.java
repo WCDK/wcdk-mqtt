@@ -214,6 +214,11 @@ public class MqttBrokerChannelHandler extends SimpleChannelInboundHandler<MqttMe
             publish(brokerMessage);
             sessionRegistry.notifySessionUpdated(session);
         } else if (qos == MqttQoS.AT_LEAST_ONCE) {
+            if (session.isDuplicateInboundQos1(packetId, message.fixedHeader().isDup())) {
+                ctx.writeAndFlush(MqttMessageBuilders.pubAck().packetId(packetId).build());
+                sessionRegistry.notifySessionUpdated(session);
+                return;
+            }
             session.recordPublicTopic(topic);
             publish(brokerMessage);
             sessionRegistry.notifySessionUpdated(session);
@@ -373,13 +378,11 @@ public class MqttBrokerChannelHandler extends SimpleChannelInboundHandler<MqttMe
     }
 
     private boolean authenticate(MqttConnectPayload payload) {
-        boolean usernameConfigured = StringUtils.hasText(properties.getUsername());
-        boolean passwordConfigured = properties.getPassword() != null;
-        if (usernameConfigured || passwordConfigured) {
-            return Objects.equals(properties.getUsername(), payload.userName())
-                    && Objects.equals(properties.getPassword(), password(payload));
+        if (properties.isAnonymous()) {
+            return true;
         }
-        return properties.isAnonymous();
+        return Objects.equals(properties.getUsername(), payload.userName())
+                && Objects.equals(properties.getPassword(), password(payload));
     }
 
     private MqttBrokerMessage willMessage(MqttConnectVariableHeader variableHeader, MqttConnectPayload payload) {

@@ -40,7 +40,7 @@ wcdk:
       boss-threads: ${MQTT_BOSS_THREADS:1}
       worker-threads: ${MQTT_WORKER_THREADS:0}
       backlog: ${MQTT_BACKLOG:1024}
-      host: ${MQTT_BROKER_HOST:0.0.0.0}
+      host: ${MQTT_BROKER_ADVERTISE_HOST:0.0.0.0}
       port: ${MQTT_BROKER_PORT:1883}
       max-payload-size: ${MQTT_MAX_PAYLOAD_SIZE:1048576}
       max-client-id-length: ${MQTT_MAX_CLIENT_ID_LENGTH:128}
@@ -57,6 +57,7 @@ wcdk:
         node-timeout-millis: ${MQTT_CLUSTER_NODE_TIMEOUT:10000}
         node-id: ${MQTT_CLUSTER_NODE_ID:}
         role: ${MQTT_CLUSTER_ROLE:MASTER}
+        master: ${MQTT_CLUSTER_MASTER:}
         channel: ${MQTT_CLUSTER_CHANNEL:tcp}
         bind-host: ${MQTT_CLUSTER_BIND_HOST:0.0.0.0}
         bind-port: ${MQTT_CLUSTER_BIND_PORT:28883}
@@ -89,6 +90,11 @@ wcdk:
     bucket: ${INFLUX_BUCKET:wcdk-messages}
     username: ${INFLUX_USERNAME:admin}
     password: ${INFLUX_PASSWORD:wcdk@2026}
+    timeout-seconds: ${INFLUX_TIMEOUT_SECONDS:120}
+    batch-size: ${INFLUX_BATCH_SIZE:500}
+    flush-interval-ms: ${INFLUX_FLUSH_INTERVAL_MS:1000}
+    max-retries: ${INFLUX_MAX_RETRIES:1}
+    query-range: ${INFLUX_QUERY_RANGE:-7d}
 logging:
   charset:
     console: ${LOGGING_CHARSET_CONSOLE:UTF-8}

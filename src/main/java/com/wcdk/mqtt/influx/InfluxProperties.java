@@ -26,5 +26,12 @@ public class InfluxProperties {
 
     private String bucket;
 
+    private long timeoutSeconds = 120;
+    private int batchSize = 500;
+    private int flushIntervalMs = 1000;
+    private int maxRetries = 1;
+
+    private String queryRange = "-7d";
+
 
 }

@@ -59,6 +59,7 @@ new Vue({
                 refreshInterval: 3000
             },
             timerId: null,
+            refreshInFlight: false,
             loading: {
                 overview: false,
                 clients: false,
@@ -180,14 +181,22 @@ new Vue({
             return !!(text && text.indexOf('<form class="login-form"') >= 0 && text.indexOf('wcdk-MQTT') >= 0);
         },
         refreshAll: async function () {
-            await Promise.all([
-                this.loadOverview(),
-                this.loadClients(),
-                this.loadSubscriptions(),
-                this.loadMessages()
-            ]);
-            if (this.activePanel === 'cluster') {
-                await this.loadClusterData();
+            if (this.refreshInFlight) {
+                return;
+            }
+            this.refreshInFlight = true;
+            try {
+                await Promise.all([
+                    this.loadOverview(),
+                    this.loadClients(),
+                    this.loadSubscriptions(),
+                    this.loadMessages()
+                ]);
+                if (this.activePanel === 'cluster') {
+                    await this.loadClusterData();
+                }
+            } finally {
+                this.refreshInFlight = false;
             }
         },
         togglePanel: function (panel) {

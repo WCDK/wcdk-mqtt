@@ -11,6 +11,7 @@ import io.swagger.v3.oas.annotations.Operation;
 import io.swagger.v3.oas.annotations.tags.Tag;
 import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
+import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -47,11 +48,11 @@ public class MqttClusterController {
         if (clusterManager == null || !clusterManager.isClusterEnabled()) {
             // 集群未启用时，返回当前节点信息
             ClusterNodeView currentNode = new ClusterNodeView();
-            currentNode.setNodeId(resolveNodeId());
+            currentNode.setNodeId(resolveNodeId(clusterManager));
             currentNode.setRole(mqttBrokerProperties.getCluster() != null ? 
                     mqttBrokerProperties.getCluster().getRole().name() : "WORKER");
             currentNode.setHost(mqttBrokerProperties.getHost());
-            currentNode.setPort(mqttBrokerProperties.getPort());
+            currentNode.setPort(clusterManager != null ? mqttBrokerProperties.getCluster().getBindPort() : 0);
             currentNode.setMqttHost(mqttBrokerProperties.getHost());
             currentNode.setMqttPort(mqttBrokerProperties.getPort());
             currentNode.setSessionCount((int) sessionRegistry.sessions().stream().filter(session -> session.isActive()).count());
@@ -90,7 +91,7 @@ public class MqttClusterController {
             currentNode.setNodeId(clusterManager.nodeId());
             currentNode.setRole(clusterManager.getRole().name());
             currentNode.setHost(mqttBrokerProperties.getHost());
-            currentNode.setPort(mqttBrokerProperties.getPort());
+            currentNode.setPort(clusterManager != null ? mqttBrokerProperties.getCluster().getBindPort() : 0);
             currentNode.setMqttHost(mqttBrokerProperties.getHost());
             currentNode.setMqttPort(mqttBrokerProperties.getPort());
             currentNode.setSessionCount((int) sessionRegistry.sessions().stream().filter(session -> session.isActive()).count());
@@ -107,12 +108,13 @@ public class MqttClusterController {
     @GetMapping("/config")
     @Operation(summary = "获取集群配置", description = "返回当前 Broker 的集群配置信息")
     public ClusterConfigView getClusterConfig() {
+        MqttBrokerClusterManager clusterManager = clusterManagerProvider.getIfAvailable();
         MqttBrokerProperties.Cluster clusterConfig = mqttBrokerProperties.getCluster();
         ClusterConfigView configView = new ClusterConfigView();
         
         if (clusterConfig == null) {
             configView.setEnabled(false);
-            configView.setNodeId(resolveNodeId());
+            configView.setNodeId(resolveNodeId(clusterManager));
             configView.setChannel("TCP");
             configView.setBindHost("0.0.0.0");
             configView.setBindPort(28883);
@@ -128,7 +130,7 @@ public class MqttClusterController {
         }
         
         configView.setEnabled(clusterConfig.isEnabled());
-        configView.setNodeId(resolveNodeId());
+        configView.setNodeId(resolveNodeId(clusterManager));
         configView.setRole(clusterConfig.getRole().name());
         configView.setChannel(clusterConfig.getChannel().name());
         configView.setBindHost(clusterConfig.getBindHost());
@@ -137,8 +139,11 @@ public class MqttClusterController {
         // 主节点配置
         if (clusterConfig.getMaster() != null) {
             MasterNodeView masterView = new MasterNodeView();
-            masterView.setHost(clusterConfig.getMaster().getHost());
-            masterView.setPort(clusterConfig.getMaster().getPort());
+            String[] firstMaster = clusterConfig.getMaster().split("[,;]", 2)[0].trim().split(":", 2);
+            masterView.setHost(firstMaster[0]);
+            if (firstMaster.length == 2) {
+                masterView.setPort(Integer.parseInt(firstMaster[1]));
+            }
             configView.setMaster(masterView);
         }
         
@@ -194,7 +199,7 @@ public class MqttClusterController {
         } else {
             statsView.setTotalNodes(1);
             statsView.setActiveNodes(1);
-            statsView.setCurrentNodeId(resolveNodeId());
+            statsView.setCurrentNodeId(resolveNodeId(clusterManager));
             statsView.setTotalClientOwners(0);
             statsView.setTotalSessionSnapshots(0);
             statsView.setTotalRetainedMessages(0);
@@ -204,7 +209,10 @@ public class MqttClusterController {
         return statsView;
     }
 
-    private String resolveNodeId() {
+    private String resolveNodeId(MqttBrokerClusterManager clusterManager) {
+        if (clusterManager != null) {
+            return clusterManager.nodeId();
+        }
         if (mqttBrokerProperties.getCluster() != null && mqttBrokerProperties.getCluster().getNodeId() != null
                 && !mqttBrokerProperties.getCluster().getNodeId().isBlank()) {
             return mqttBrokerProperties.getCluster().getNodeId().trim();
