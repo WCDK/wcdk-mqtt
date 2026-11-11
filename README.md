@@ -1,490 +1,233 @@
 # wcdk-mqtt
 
-## 概述
+基于 **Java Reactor（Spring Boot + Reactor Netty）** 从零实现的响应式 MQTT Broker，支持 **MQTT 3.1 / 3.1.1 / 5.0** 协议与**对等集群**，内置 REST 管理接口与网页控制台。
 
-`wcdk-mqtt` 是基于 Spring Boot、Netty 和 WebFlux 实现的 MQTT Broker 服务，提供 MQTT 终端接入、发布订阅、会话管理、集群通信、消息持久化和 HTTP 管理接口。
+- 全链路非阻塞：MQTT 接入、集群通道、管理接口均为 Reactor Netty 响应式实现，无 `.block()`、无手动线程阻塞等待。
+- **纯内存存储**：会话状态、保留消息、离线队列全部保存在内存中，重启即重置，集群节点之间自动同步；**不依赖任何外部存储（无数据库、无 InfluxDB、无消息队列）**。
+- 对等集群：所有节点地位相同，**无 MASTER/WORKER 之分**，配置 `node-id` / `bind-port` / `peers` 即可组网，单实例可关闭集群。
 
-默认端口：
+## 一、功能特性
 
-| 用途 | 默认端口 |
-| --- | ---: |
-| MQTT 接入 | `1883` |
-| HTTP 管理接口 | `38082` |
-| 集群 TCP 通道 | `28883` |
+| 分类     | 说明                                                                 |
+| -------- | -------------------------------------------------------------------- |
+| 协议     | MQTT 3.1 / 3.1.1 / 5.0，CONNECT / PUBLISH / SUBSCRIBE / UNSUBSCRIBE / PUBACK / PUBREC / PUBREL / PUBCOMP / PINGREQ / DISCONNECT |
+| QoS      | QoS 0、1、2 全支持，含入站/出站双方向的报文去重与超时重投            |
+| 会话     | Clean Session / 持久会话、MQTT5 Session Expiry Interval（过期后自动清理会话）、Keep Alive 超时断开、同 ID 重连自动接管、离线消息缓冲 |
+| 消息     | 保留消息（Retain）、遗嘱消息（Will）、通配符订阅 `+` / `#`、按 QoS 降级投递 |
+| 安全     | 用户名密码认证、匿名开关、主题级读写 ACL                              |
+| 集群     | 对等节点互拨、心跳保活、重复连接自动消解、会话/保留消息/发布实时同步、跨节点点对点投递与强制下线 |
+| 管理端   | REST 管理接口 + 网页控制台（表单登录、概览、客户端、消息、保留消息、集群、模拟发布），SSE 实时推送 |
 
-## 特性
-
-- 支持 MQTT 3.1、MQTT 3.1.1 和 MQTT 5 CONNECT 协议版本。
-- 支持 QoS 0、QoS 1、QoS 2 发布和订阅。
-- 支持 Clean Session、Keep Alive、自动重连和遗嘱消息。
-- 支持保留消息、离线消息队列和消息持久化。
-- 支持用户名密码认证、匿名连接配置和 ACL 访问控制。
-- 支持集群/主从、多主节点和主从节点自动重连。
-- 支持主节点之间的对等连接和客户端连接代理。
-- 支持主从节点负载
-- 主节点可设为非工作节点  include-master: false
-- 支持消息投递 ACK、客户端 ACK 和 QoS 状态恢复。
-- 提供集群节点、集群配置、集群统计和消息管理接口。
-- 支持 InfluxDB 消息持久化扩展。
-- 支持大 payload 限制、客户端 ID 长度限制、连接 backlog 和 Netty 线程配置。
-
-## 使用方法
+## 二、快速开始
 
 ### 环境要求
 
-- JDK 21
+- JDK 21+
 - Maven 3.9+
-- 可选：InfluxDB 2.x
 
-### 编译和启动
+### 本地构建运行
 
-```powershell
-mvn -f wcdk-mqtt/pom.xml -DskipTests package
-java -jar wcdk-mqtt/target/wcdk-mqtt-3.5.16.jar
+```bash
+mvn -o clean package -DskipTests
+java -jar target/wcdk-mqtt-*.jar
 ```
 
-也可以使用 Spring Boot Maven 插件启动：
+或直接开发模式启动：
 
-```powershell
-mvn -f wcdk-mqtt/pom.xml spring-boot:run
+```bash
+mvn -o spring-boot:run
 ```
 
-### 单 Broker 配置
+启动后：
+
+- 网页控制台：<http://localhost:38082/> （默认账号 `admin/admin`，生产环境请修改）
+- MQTT 接入地址：`localhost:1883`
+- 集群通道地址：`localhost:28883`（默认单实例不启用集群）
+
+### 运行测试
+
+```bash
+mvn -o test
+```
+
+## 三、端口说明
+
+| 端口  | 用途                                |
+| ----- | ----------------------------------- |
+| 38082 | HTTP 管理接口与网页控制台           |
+| 1883  | MQTT 接入端口                       |
+| 28883 | 集群对等通道端口                    |
+
+## 四、配置说明
+
+配置前缀 `wcdk.mqtt`，完整示例见 `src/main/resources/application.yml`。
 
 ```yaml
 wcdk:
   mqtt:
     broker:
-      enabled: true
+      enabled: true              # 是否启用 MQTT 接入
       host: 0.0.0.0
       port: 1883
-      anonymous: true
-      username: admin
-      password: wcdk@2026
-      max-payload-size: 1048576
-      max-client-id-length: 128
-      retained-messages: true
-      persistence: true
+      max-payload-size: 1048576   # 单条消息最大负载（字节）
+      max-offline-messages: 1000  # 单个离线会话最大缓存
+      max-outbound-buffer: 4096   # 单连接出站缓冲上限，写满判定慢消费者并断开
+      retransmit-timeout-millis: 10000
+      max-retransmit-attempts: 3
+      message-log-capacity: 500   # 控制台最近消息容量
+    security:
+      anonymous: true             # 是否允许匿名 MQTT 连接
+      username:                   # MQTT 认证账号（为空则不校验）
+      password:
+      console-username: admin     # 控制台登录账号
+      console-password: admin
+    acl:
+      enabled: false              # 主题级访问控制开关
+      default-policy: allow
+      rules: []
+    cluster:
+      enabled: false              # 单实例保持 false
+      node-id: node-1             # 节点唯一 ID
+      bind-host: 0.0.0.0
+      bind-port: 28883
+      advertise-host:             # 对外公布地址，多节点部署必填
+      peers: []                   # 对等地址列表，格式 host:port
+      username:                   # 集群通道认证账号（为空则不校验，配置后所有节点必须一致）
+      password:
+      heartbeat-interval-millis: 5000
+      node-timeout-millis: 15000
+      reconnect-delay-millis: 3000
+    console:
+      enabled: true
 ```
-```yaml
-version: '3.8'
 
-services:
-  mqtt-master-1:
-    image: wcdk-mqtt:1.0.0
-    container_name: mqtt-master-1
-    hostname: mqtt-master-1
-    ports:
-      - "38082:38082"
-      - "1883:1883"
-      - "28883:28883"
-    environment:
-      SERVER_PORT: "38082"
-      MQTT_BROKER_PORT: "1883"
-      MQTT_USERNAME: "admin"
-      MQTT_PASSWORD: "wcdk@2026"
-      MQTT_CLUSTER_ENABLED: "true"
-      MQTT_CLUSTER_NODE_ID: "mqtt-master-1"
-      MQTT_CLUSTER_ROLE: "MASTER"
-      MQTT_CLUSTER_CHANNEL: "tcp"
-      MQTT_CLUSTER_BIND_HOST: "0.0.0.0"
-      MQTT_CLUSTER_BIND_PORT: "28883"
-      MQTT_CLUSTER_HEARTBEAT_INTERVAL: "1000"
-      MQTT_CLUSTER_NODE_TIMEOUT: "10000"
-      MQTT_CLUSTER_GLOBAL_SESSION: "false"
-      MQTT_CLUSTER_LOAD_BALANCE_ENABLED: "true"
-      MQTT_CLUSTER_LOAD_BALANCE_INCLUDE_MASTER: "false"
-      MQTT_CLUSTER_USERNAME: "admin"
-      MQTT_CLUSTER_PASSWORD: "wcdk@2026"
-      MQTT_CLUSTER_DELIVERY_ACK_ENABLED: "true"
-      MQTT_CLUSTER_CLIENT_ACK_ENABLED: "true"
-      MQTT_CLUSTER_PEERS: "mqtt-master-2:28883"
-      INFLUX_ENABLED: "true"
-      INFLUX_URL: "http://influxdb:8086"
-      INFLUX_TOKEN: ""
-      INFLUX_ORG: "wcdk"
-      INFLUX_BUCKET: "wcdk-messages"
-      INFLUX_USERNAME: "admin"
-      INFLUX_PASSWORD: "wcdk@2026"
-    networks:
-      mqtt-cluster:
-        ipv4_address: 172.20.0.10
-    restart: unless-stopped
+Spring Boot 标准的环境变量覆盖同样适用，例如：
 
-  mqtt-master-2:
-    image: wcdk-mqtt:1.0.0
-    container_name: mqtt-master-2
-    hostname: mqtt-master-2
-    ports:
-      - "38092:38082"
-      - "1884:1883"
-      - "28884:28883"
-    environment:
-      SERVER_PORT: "38082"
-      MQTT_BROKER_PORT: "1883"
-      MQTT_USERNAME: "admin"
-      MQTT_PASSWORD: "wcdk@2026"
-      MQTT_CLUSTER_ENABLED: "true"
-      MQTT_CLUSTER_NODE_ID: "mqtt-master-2"
-      MQTT_CLUSTER_ROLE: "MASTER"
-      MQTT_CLUSTER_CHANNEL: "tcp"
-      MQTT_CLUSTER_BIND_HOST: "0.0.0.0"
-      MQTT_CLUSTER_BIND_PORT: "28883"
-      MQTT_CLUSTER_HEARTBEAT_INTERVAL: "1000"
-      MQTT_CLUSTER_NODE_TIMEOUT: "10000"
-      MQTT_CLUSTER_GLOBAL_SESSION: "false"
-      MQTT_CLUSTER_LOAD_BALANCE_ENABLED: "true"
-      MQTT_CLUSTER_LOAD_BALANCE_INCLUDE_MASTER: "false"
-      MQTT_CLUSTER_USERNAME: "admin"
-      MQTT_CLUSTER_PASSWORD: "wcdk@2026"
-      MQTT_CLUSTER_DELIVERY_ACK_ENABLED: "true"
-      MQTT_CLUSTER_CLIENT_ACK_ENABLED: "true"
-      MQTT_CLUSTER_PEERS: "mqtt-master-1:28883"
-      INFLUX_ENABLED: "true"
-      INFLUX_URL: "http://influxdb:8086"
-      INFLUX_TOKEN: ""
-      INFLUX_ORG: "wcdk"
-      INFLUX_BUCKET: "wcdk-messages"
-      INFLUX_USERNAME: "admin"
-      INFLUX_PASSWORD: "wcdk@2026"
-    networks:
-      mqtt-cluster:
-        ipv4_address: 172.20.0.11
-    restart: unless-stopped
-
-
-  mqtt-worker-1:
-    image: wcdk-mqtt:1.0.0
-    container_name: mqtt-worker-1
-    hostname: mqtt-worker-1
-    ports:
-      - "39082:38082"
-      - "1903:1883"
-      - "28886:28883"
-    environment:
-      SERVER_PORT: "38082"
-      MQTT_BROKER_PORT: "1883"
-      MQTT_USERNAME: "admin"
-      MQTT_PASSWORD: "wcdk@2026"
-      MQTT_CLUSTER_ENABLED: "true"
-      MQTT_CLUSTER_NODE_ID: "mqtt-worker-1"
-      MQTT_CLUSTER_ROLE: "WORKER"
-      MQTT_CLUSTER_CHANNEL: "tcp"
-      MQTT_CLUSTER_BIND_HOST: "0.0.0.0"
-      MQTT_CLUSTER_BIND_PORT: "28883"
-      MQTT_CLUSTER_HEARTBEAT_INTERVAL: "1000"
-      MQTT_CLUSTER_NODE_TIMEOUT: "10000"
-      MQTT_CLUSTER_GLOBAL_SESSION: "false"
-      MQTT_CLUSTER_LOAD_BALANCE_ENABLED: "true"
-      MQTT_CLUSTER_LOAD_BALANCE_INCLUDE_MASTER: "false"
-      MQTT_CLUSTER_MASTER: "mqtt-master-1:28883,mqtt-master-2:28883"
-      MQTT_CLUSTER_USERNAME: "admin"
-      MQTT_CLUSTER_PASSWORD: "wcdk@2026"
-      MQTT_CLUSTER_DELIVERY_ACK_ENABLED: "true"
-      MQTT_CLUSTER_CLIENT_ACK_ENABLED: "true"
-      INFLUX_ENABLED: "true"
-      INFLUX_URL: "http://influxdb:8086"
-      INFLUX_TOKEN: ""
-      INFLUX_ORG: "wcdk"
-      INFLUX_BUCKET: "wcdk-messages"
-      INFLUX_USERNAME: "admin"
-      INFLUX_PASSWORD: "wcdk@2026"
-    networks:
-      mqtt-cluster:
-        ipv4_address: 172.20.0.13
-    restart: unless-stopped
-
-  mqtt-worker-2:
-    build:
-      context: .
-      dockerfile: Dockerfile
-    image: wcdk-mqtt:1.0.0
-    container_name: mqtt-worker-2
-    hostname: mqtt-worker-2
-    ports:
-      - "39092:38082"
-      - "1913:1883"
-      - "28887:28883"
-    environment:
-      SERVER_PORT: "38082"
-      MQTT_BROKER_PORT: "1883"
-      MQTT_USERNAME: "admin"
-      MQTT_PASSWORD: "wcdk@2026"
-      MQTT_CLUSTER_ENABLED: "true"
-      MQTT_CLUSTER_NODE_ID: "mqtt-worker-2"
-      MQTT_CLUSTER_ROLE: "WORKER"
-      MQTT_CLUSTER_CHANNEL: "tcp"
-      MQTT_CLUSTER_BIND_HOST: "0.0.0.0"
-      MQTT_CLUSTER_BIND_PORT: "28883"
-      MQTT_CLUSTER_HEARTBEAT_INTERVAL: "1000"
-      MQTT_CLUSTER_NODE_TIMEOUT: "10000"
-      MQTT_CLUSTER_GLOBAL_SESSION: "false"
-      MQTT_CLUSTER_LOAD_BALANCE_ENABLED: "true"
-      MQTT_CLUSTER_LOAD_BALANCE_INCLUDE_MASTER: "false"
-      MQTT_CLUSTER_MASTER: "mqtt-master-1:28883,mqtt-master-2:28883"
-      MQTT_CLUSTER_USERNAME: "admin"
-      MQTT_CLUSTER_PASSWORD: "wcdk@2026"
-      MQTT_CLUSTER_DELIVERY_ACK_ENABLED: "true"
-      MQTT_CLUSTER_CLIENT_ACK_ENABLED: "true"
-      INFLUX_ENABLED: "true"
-      INFLUX_URL: "http://influxdb:8086"
-      INFLUX_TOKEN: ""
-      INFLUX_ORG: "wcdk"
-      INFLUX_BUCKET: "wcdk-messages"
-      INFLUX_USERNAME: "admin"
-      INFLUX_PASSWORD: "wcdk@2026"
-    networks:
-      mqtt-cluster:
-        ipv4_address: 172.20.0.14
-    restart: unless-stopped
-
-  influxdb:
-    image: influxdb:2.9
-    container_name: mqtt-influxdb
-    ports:
-      - "38086:8086"
-    environment:
-      DOCKER_INFLUXDB_INIT_MODE: setup
-      DOCKER_INFLUXDB_INIT_USERNAME: admin
-      DOCKER_INFLUXDB_INIT_PASSWORD: wcdk@2026
-      DOCKER_INFLUXDB_INIT_ORG: wcdk
-      DOCKER_INFLUXDB_INIT_BUCKET: wcdk-messages
-    volumes:
-      - influxdb-data:/var/lib/influxdb2
-    networks:
-      mqtt-cluster:
-    restart: unless-stopped
-
-volumes:
-  influxdb-data:
-networks:
-  mqtt-cluster:
-    driver: bridge
-    ipam:
-      config:
-        - subnet: 172.20.0.0/24
-
-
-
-
-
-
+```bash
+WCDK_MQTT_CLUSTER_ENABLED=true \
+WCDK_MQTT_CLUSTER_NODE-ID=node-1 \
+WCDK_MQTT_CLUSTER_PEERS_0=192.168.1.11:28883 \
+java -jar target/wcdk-mqtt-*.jar
 ```
-客户端使用 `tcp://127.0.0.1:1883` 连接，认证信息为 `admin / wcdk@2026`。
 
-### 两主一从集群
-
-三个实例的 MQTT 端口和集群端口分别为：
-
-| 实例 | 角色 | MQTT 端口 | 集群端口 | 节点 ID |
-| --- | --- | ---: | ---: | --- |
-| `wcdk-mqtt` | MASTER | `1883` | `28883` | `mqtt-master-1` |
-| `wcdk-mqtt2` | MASTER | `1884` | `28884` | `mqtt-master-2` |
-| `wcdk-mqtt3` | WORKER | `1885` | `28885` | `mqtt-worker-1` |
-
-主节点需要互相配置 `peers`：
+### ACL 规则示例
 
 ```yaml
 wcdk:
   mqtt:
-    broker:
-      cluster:
-        enabled: true
-        role: MASTER
-        node-id: mqtt-master-1
-        bind-host: 0.0.0.0
-        bind-port: 28883
-        username: admin
-        password: wcdk@2026
-        peers:
-           - 127.0.0.1:28884
+    acl:
+      enabled: true
+      default-policy: deny
+      rules:
+        - policy: allow
+          action: all
+          usernames: [ "admin" ]
+          topicFilters: [ "#" ]
+        - policy: allow
+          action: subscribe
+          usernames: [ "sensor" ]
+          topicFilters: [ "sensors/#" ]
 ```
 
-第二个主节点将自身信息改为 `mqtt-master-2`、`28884`，并将 `peers` 改为：
+## 五、集群部署
+
+集群为**对等模型**，任意两个节点互相配置 `peers` 即可成组：
 
 ```yaml
-peers:
-  - 127.0.0.1:28883
+# 节点 A
+wcdk.mqtt.cluster.enabled=true
+wcdk.mqtt.cluster.node-id=node-a
+wcdk.mqtt.cluster.advertise-host=192.168.1.10
+wcdk.mqtt.cluster.peers[0]=192.168.1.11:28883
+
+# 节点 B
+wcdk.mqtt.cluster.enabled=true
+wcdk.mqtt.cluster.node-id=node-b
+wcdk.mqtt.cluster.advertise-host=192.168.1.11
+wcdk.mqtt.cluster.peers[0]=192.168.1.10:28883
 ```
 
-从节点配置多个主节点：
+工作方式：
 
-```yaml
-wcdk:
-  mqtt:
-    broker:
-      cluster:
-        enabled: true
-        role: WORKER
-        node-id: mqtt-worker-1
-        bind-host: 0.0.0.0
-        bind-port: 28885
-        username: admin
-        password: wcdk@2026
-        masters:
-          - host: 127.0.0.1
-            port: 28883
-            username: admin
-            password: wcdk@2026
-          - host: 127.0.0.1
-            port: 28884
-            username: admin
-            password: wcdk@2026
+1. 每个节点在 `bind-port` 上监听，并按 `peers` 周期性主动拨号；
+2. 双方通过 `HELLO` 握手交换节点身份，配置了 `username` 时校验集群凭据，认证失败即断开；若出现重复连接，按「节点 ID 字典序较小的一方保留自己拨出的连接」自动消解；
+3. 心跳由写空闲触发，读空闲超时即判定对端下线并断开，守护线程周期重拨；
+4. 客户端会话归属、保留消息、消息发布、强制下线指令在节点间实时同步；
+5. 客户端连接任意节点均可服务，跨节点的点对点消息按会话归属路由。
+
+Docker 单节点与多节点部署详见 [docker.md](docker.md)。
+
+## 六、管理接口
+
+所有接口需登录（表单登录或 HTTP Basic），未认证访问 `/api/**` 返回 `401` JSON。
+
+| 方法   | 路径                              | 说明                             |
+| ------ | --------------------------------- | -------------------------------- |
+| GET    | `/api/overview`                   | Broker 运行概览统计              |
+| GET    | `/api/me`                         | 当前登录用户                     |
+| GET    | `/api/clients`                    | 客户端列表（支持关键字与在线过滤） |
+| GET    | `/api/clients/{clientId}`         | 客户端详情                       |
+| GET    | `/api/clients/{clientId}/subscriptions` | 客户端订阅明细             |
+| DELETE | `/api/clients/{clientId}`         | 强制下线，`clear=true` 同时清除会话 |
+| GET    | `/api/subscriptions`              | 全部订阅聚合查询                 |
+| GET    | `/api/messages`                   | 最近消息查询                     |
+| DELETE | `/api/messages`                   | 按条件或 ID 清理最近消息         |
+| GET    | `/api/retained`                   | 保留消息列表                     |
+| DELETE | `/api/retained`                   | 删除指定主题保留消息             |
+| POST   | `/api/publish`                    | 模拟发布（支持 Base64 负载与点对点投递） |
+| GET    | `/api/cluster`                    | 集群与对等节点状态               |
+| GET    | `/api/stream`                     | 消息与会话实时事件流（SSE）      |
+
+响应统一包装：
+
+```json
+{ "code": 0, "message": "操作成功", "data": { } }
 ```
 
-如果节点不在同一台机器，将 `127.0.0.1` 替换为实际主机 IP。集群认证使用 `cluster.username` 和 `cluster.password`，三个节点必须保持一致。
+## 七、Docker 部署
 
-建议启动顺序为两个主节点，再启动从节点。查看集群状态：
+```bash
+# 构建镜像
+docker build -t wcdk1024/wcdk-mqtt:1.0.0 .
 
-```text
-GET http://127.0.0.1:38082/wcdk/mqtt/cluster/nodes
-GET http://127.0.0.1:38082/wcdk/mqtt/cluster/config
-GET http://127.0.0.1:38082/wcdk/mqtt/cluster/stats
+# 单节点
+docker compose up -d
+
+# 三节点集群
+docker compose --profile cluster up -d
 ```
 
-### MQTT 客户端多 Broker
+详见 [docker.md](docker.md)。
 
-依赖 `wcdk-iot-protocol-mqtt` 的客户端可以配置多个 Broker：
+## 八、项目结构
 
-```yaml
-wcdk:
-  mqtt:
-    server-uri: tcp://127.0.0.1:1883
-    server-uris:
-      - tcp://127.0.0.1:1883
-      - tcp://127.0.0.1:1884
-      - tcp://127.0.0.1:1885
-    client-id: wcdk-iot-client
-    username: admin
-    password: wcdk@2026
+```
+src/main/java/com/wcdk/mqtt/
+├── MqttBrokerApplication.java   # 应用入口
+├── config/                      # 配置属性、安全链、Web 路由、Bean 装配
+├── core/                        # 会话、注册表、主题匹配、ACL、保留消息、消息日志
+├── protocol/                    # MQTT 接入服务端、连接协议状态机、会话巡检
+├── cluster/                     # 对等集群：握手、心跳、事件路由、状态同步
+├── controller/                  # REST 管理接口
+├── service/                     # 发布与概览业务门面
+└── web/                         # 控制台 SSE 事件总线
+src/main/resources/
+├── application.yml              # 默认配置
+└── static/                      # 网页控制台（index.html / login.html / app.js）
 ```
 
-`server-uri` 保留为首选地址和兼容配置。`server-uris` 配置多个地址后，Paho 客户端会在连接失败或自动重连时尝试其他 Broker。
+## 九、测试
 
-### ACL 配置
+```bash
+# 全量测试
+mvn -o test
 
-```yaml
-wcdk:
-  mqtt:
-    broker:
-      acl:
-        enabled: true
-        default-policy: DENY
-        rules:
-          - enabled: true
-            policy: ALLOW
-            action: SUBSCRIBE
-            usernames:
-              - admin
-            topic-filters:
-              - devices/+/telemetry
-    
+# 单个测试
+mvn -o -q test -Dtest=MqttPipelineSpikeTest
 ```
 
-ACL 支持 `PUBLISH`、`SUBSCRIBE` 和 `ALL` 操作，并可按用户名、客户端 ID 和 Topic 过滤器匹配。
+测试报告位于 `target/surefire-reports/`。
 
-### 常用管理接口
+## 十、License
 
-管理接口默认由 Spring WebFlux 提供，完整接口可通过 Knife4j 或 OpenAPI 查看：
-
-```text
-http://127.0.0.1:38082/swagger-ui.html
-http://127.0.0.1:38082/doc.html
-```
-
-集群接口前缀为 `/wcdk/mqtt/cluster`，消息和客户端管理接口可通过 Swagger 页面查看。
-
-## 优势
-
-- **协议接入性能高**：使用 Netty NIO 事件驱动模型，减少线程阻塞和连接开销。
-- **故障转移能力强**：Broker 集群支持主节点互连、从节点多主连接和重连；客户端支持多 Broker 地址。
-- **消息可靠性完整**：覆盖 QoS、ACK、持久化、离线队列和会话状态恢复。
-- **部署方式灵活**：可以单 Broker 部署，也可以按两主一从或多主节点部署。
-- **配置粒度细**：可独立配置 MQTT、HTTP、集群、ACL、InfluxDB、线程池和 payload 限制。
-- **可观测性完善**：提供节点状态、连接状态、会话、消息、保留消息和离线消息统计。
-- **扩展成本低**：Broker 事件、消息持久化和配置同步通过监听器及服务组件扩展。
-
-## 已有能力
-
-### MQTT 协议能力
-
-- CONNECT、CONNACK、PUBLISH、PUBACK、PUBREC、PUBREL、PUBCOMP。
-- SUBSCRIBE、SUBACK、UNSUBSCRIBE、UNSUBACK。
-- PINGREQ、PINGRESP、DISCONNECT。
-- QoS 0/1/2 状态管理和消息确认。
-- Topic 名称及通配符过滤器校验。
-- Retain、Will、Clean Session 和 Keep Alive。
-
-### 会话和消息能力
-
-- 客户端在线会话注册和注销。
-- 订阅关系维护。
-- 保留消息存储和订阅时推送。
-- 离线消息队列。
-- QoS 1、QoS 2 未完成消息状态恢复。
-- 消息入队、重试、过期和容量限制。
-- 集群消息广播、定向投递和投递确认。
-
-### 集群能力
-
-- MASTER 和 WORKER 节点角色。
-- 主节点 peers 对等连接。
-- 工作节点 `masters` 多主节点连接。
-- 集群 TCP 通道认证。
-- 心跳、节点存活判断和自动重连。
-- 客户端会话归属和集群节点状态同步。
-- 主节点负载均衡和 MQTT TCP 连接代理。
-- 集群节点、配置和统计 HTTP 查询。
-
-### 安全与运维能力
-
-- 用户名密码认证。
-- 匿名连接开关。
-- Topic ACL。
-- 客户端 ID 和 payload 长度限制。
-- 日志输出连接地址、代理目标、失败原因和集群节点状态。
-- InfluxDB 消息持久化扩展。
-
-## 实现技术
-
-| 技术 | 用途 |
-| --- | --- |
-| Spring Boot | 应用启动、配置绑定和 Bean 装配 |
-| Spring WebFlux | HTTP 管理接口和响应式 Web 服务 |
-| Netty | MQTT TCP 接入、协议编解码、集群 TCP 通道和连接代理 |
-| Netty MQTT Codec | MQTT 报文解码与编码 |
-| Java 21 | 运行时和并发基础能力 |
-| Lombok | 配置对象和数据对象样板代码 |
-| ConcurrentHashMap / ConcurrentLinkedQueue | 会话、消息、节点和 ACK 状态的并发存储 |
-| InfluxDB Client | 可选消息时序持久化 |
-| Swagger / Knife4j | HTTP 接口文档和调试 |
-| Maven | 模块构建和依赖管理 |
-
-核心代码分层：
-
-- `core.core.ReactorMqttBroker`：MQTT TCP 服务启动和连接接入。
-- `core.core.MqttBrokerChannelHandler`：CONNECT、PUBLISH、SUBSCRIBE 等 MQTT 行为处理。
-- `core.core.MqttBrokerSession`：客户端会话、订阅和 QoS 状态。
-- `core.core.MqttBrokerSessionRegistry`：会话注册、保留消息和消息分发。
-- `core.cluster.MqttClusterTcpChannel`：集群节点连接、认证、心跳和重连。
-- `core.core.MqttBrokerClusterManager`：节点状态、集群消息和会话协调。
-- `core.core.MqttTcpProxyHandler`：主节点间 MQTT TCP 连接代理。
-- `controller.MqttClusterController`：集群查询和管理接口。
-
-## 注意事项
-
-- 多实例部署时，每个节点的 MQTT 端口、集群端口和节点 ID 必须唯一。
-- 集群认证账号必须在所有节点保持一致。
-- 使用 `0.0.0.0` 作为绑定地址时，应通过 `bind-host` 或实际主机地址配置可被其他节点访问的地址。
-- 集群端口必须在防火墙和容器网络中放行。
-- 修改配置后必须重启对应 Broker 实例。
-- 生产环境不建议使用默认密码，应通过外部配置覆盖账号密码。
-
-## 贡献
-
-欢迎提交 Issue 和 Pull Request！
-
-## 联系方式
-
-- 作者：WCDK
-- 邮箱：wcdk1024@gmail.com
+MIT

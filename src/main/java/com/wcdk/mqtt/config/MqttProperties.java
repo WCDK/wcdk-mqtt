@@ -1,0 +1,220 @@
+package com.wcdk.mqtt.config;
+
+import java.util.ArrayList;
+import java.util.List;
+
+import lombok.Data;
+import org.springframework.boot.context.properties.ConfigurationProperties;
+
+/***
+* MQTT Broker 全局配置，绑定 wcdk.mqtt 前缀下的配置项。
+* @author wcdk
+***/
+@Data
+@ConfigurationProperties(prefix = "wcdk.mqtt")
+public class MqttProperties {
+
+    /** MQTT 接入配置 */
+    private Broker broker = new Broker();
+
+    /** 认证与控制台安全配置 */
+    private Security security = new Security();
+
+    /** 访问控制列表配置 */
+    private Acl acl = new Acl();
+
+    /** 集群配置 */
+    private Cluster cluster = new Cluster();
+
+    /** 管理控制台配置 */
+    private Console console = new Console();
+
+    /***
+    * MQTT 接入相关配置。
+    * @author wcdk
+    ***/
+    @Data
+    public static class Broker {
+
+        /** 是否启用 MQTT Broker */
+        private boolean enabled = true;
+
+        /** MQTT 监听地址 */
+        private String host = "0.0.0.0";
+
+        /** MQTT 监听端口 */
+        private int port = 1883;
+
+        /** 单条消息最大负载字节数 */
+        private int maxPayloadSize = 1024 * 1024;
+
+        /** 客户端 ID 最大长度 */
+        private int maxClientIdLength = 128;
+
+        /** 是否支持保留消息 */
+        private boolean retainedMessages = true;
+
+        /** 是否为离线持久会话缓存消息 */
+        private boolean offlineQueue = true;
+
+        /** 单个离线会话最大缓存消息数 */
+        private int maxOfflineMessages = 1000;
+
+        /** 出站消息确认超时毫秒，超过后重投 */
+        private long retransmitTimeoutMillis = 10_000;
+
+        /** 出站消息最大重投次数 */
+        private int maxRetransmitAttempts = 3;
+
+        /** 会话扫描间隔秒数，用于 Keep Alive 与重投检查 */
+        private int sweepIntervalSeconds = 5;
+
+        /** 单连接出站缓冲消息数上限，超出判定为慢消费者并断开连接 */
+        private int maxOutboundBuffer = 4096;
+
+        /** 最近日志消息容量 */
+        private int messageLogCapacity = 500;
+    }
+
+    /***
+    * 认证与控制台安全配置。
+    * @author wcdk
+    ***/
+    @Data
+    public static class Security {
+
+        /** 是否允许匿名 MQTT 连接 */
+        private boolean anonymous = true;
+
+        /** MQTT 认证用户名 */
+        private String username;
+
+        /** MQTT 认证密码 */
+        private String password;
+
+        /** 控制台登录用户名，为空时复用 MQTT 用户名 */
+        private String consoleUsername;
+
+        /** 控制台登录密码，为空时复用 MQTT 密码 */
+        private String consolePassword;
+    }
+
+    /***
+    * 访问控制列表配置。
+    * @author wcdk
+    ***/
+    @Data
+    public static class Acl {
+
+        /** 是否启用访问控制 */
+        private boolean enabled;
+
+        /** 未命中任何规则时的默认策略 */
+        private Policy defaultPolicy = Policy.ALLOW;
+
+        /** 规则列表，按顺序匹配，首个命中生效 */
+        private List<AclRule> rules = new ArrayList<>();
+    }
+
+    /***
+    * 单条访问控制规则。
+    * @author wcdk
+    ***/
+    @Data
+    public static class AclRule {
+
+        /** 是否启用该规则 */
+        private boolean enabled = true;
+
+        /** 命中后的策略 */
+        private Policy policy = Policy.ALLOW;
+
+        /** 作用的操作类型 */
+        private Action action = Action.ALL;
+
+        /** 匹配的用户名列表，支持 * 通配，为空表示不限制 */
+        private List<String> usernames = new ArrayList<>();
+
+        /** 匹配的客户端 ID 列表，支持 * 通配，为空表示不限制 */
+        private List<String> clientIds = new ArrayList<>();
+
+        /** 匹配的主题过滤器列表，为空表示不限制 */
+        private List<String> topicFilters = new ArrayList<>();
+    }
+
+    /***
+    * 集群配置，所有节点对等，无主从角色之分。
+    * @author wcdk
+    ***/
+    @Data
+    public static class Cluster {
+
+        /** 是否启用集群 */
+        private boolean enabled;
+
+        /** 本节点唯一 ID，为空时自动生成 */
+        private String nodeId;
+
+        /** 集群端口监听地址 */
+        private String bindHost = "0.0.0.0";
+
+        /** 集群端口监听端口 */
+        private int bindPort = 28883;
+
+        /** 对外公布的主机地址，为空时按监听地址自动推断 */
+        private String advertiseHost;
+
+        /** 对等节点地址列表，格式 host:port */
+        private List<String> peers = new ArrayList<>();
+
+        /** 集群通道认证用户名，为空表示不认证 */
+        private String username;
+
+        /** 集群通道认证密码 */
+        private String password;
+
+        /** 心跳间隔毫秒 */
+        private long heartbeatIntervalMillis = 5000;
+
+        /** 节点判定下线的超时毫秒 */
+        private long nodeTimeoutMillis = 15000;
+
+        /** 对等节点断线重连间隔毫秒 */
+        private long reconnectDelayMillis = 3000;
+    }
+
+    /***
+    * 管理控制台配置。
+    * @author wcdk
+    ***/
+    @Data
+    public static class Console {
+
+        /** 是否启用网页控制台 */
+        private boolean enabled = true;
+    }
+
+    /***
+    * 访问控制策略枚举。
+    * @author wcdk
+    ***/
+    public enum Policy {
+        /** 允许 */
+        ALLOW,
+        /** 拒绝 */
+        DENY
+    }
+
+    /***
+    * 访问控制操作类型枚举。
+    * @author wcdk
+    ***/
+    public enum Action {
+        /** 发布与订阅 */
+        ALL,
+        /** 仅发布 */
+        PUBLISH,
+        /** 仅订阅 */
+        SUBSCRIBE
+    }
+}

@@ -1,0 +1,100 @@
+# wcdk-mqtt 部署编排
+# 单节点：docker compose up -d
+# 三节点集群：docker compose --profile cluster up -d
+#
+# 集群为对等模型（无 MASTER/WORKER），每个节点都可独立提供服务；
+# 多节点部署务必为每个节点配置唯一的 node-id 与可互相访问的 advertise-host。
+
+services:
+  # ---------- 单节点（默认） ----------
+  mqtt-broker:
+    build: .
+    image: wcdk1024/wcdk-mqtt:1.0.0
+    container_name: wcdk-mqtt
+    profiles: ["single"]
+    restart: unless-stopped
+    ports:
+      - "38082:38082"   # HTTP 管理接口与网页控制台
+      - "1883:1883"     # MQTT 接入
+    environment:
+      TZ: Asia/Shanghai
+      # 控制台与 MQTT 认证账号（生产环境务必修改）
+      WCDK_MQTT_SECURITY_CONSOLE-USERNAME: admin
+      WCDK_MQTT_SECURITY_CONSOLE-PASSWORD: admin
+      # 单节点关闭集群
+      WCDK_MQTT_CLUSTER_ENABLED: "false"
+    healthcheck:
+      # 探测 MQTT 接入端口是否监听，java -version 只能证明 JVM 存在无法反映服务状态
+      test: ["CMD-SHELL", "timeout 3 bash -c 'exec 3<>/dev/tcp/127.0.0.1/1883' || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 40s
+
+  # ---------- 多节点集群（profile: cluster） ----------
+  mqtt-node1:
+    build: .
+    image: wcdk1024/wcdk-mqtt:1.0.0
+    container_name: wcdk-mqtt-node1
+    profiles: ["cluster"]
+    restart: unless-stopped
+    ports:
+      - "38082:38082"
+      - "1883:1883"
+      - "28883:28883"
+    environment:
+      TZ: Asia/Shanghai
+      WCDK_MQTT_SECURITY_CONSOLE-USERNAME: admin
+      WCDK_MQTT_SECURITY_CONSOLE-PASSWORD: admin
+      WCDK_MQTT_CLUSTER_ENABLED: "true"
+      WCDK_MQTT_CLUSTER_NODE-ID: node-1
+      WCDK_MQTT_CLUSTER_BIND-HOST: 0.0.0.0
+      WCDK_MQTT_CLUSTER_BIND-PORT: 28883
+      # 对外公布地址，供其他节点回连，容器场景建议填宿主机地址或容器网络别名
+      WCDK_MQTT_CLUSTER_ADVERTISE-HOST: mqtt-node1
+      WCDK_MQTT_CLUSTER_PEERS_0: mqtt-node2:28883
+      WCDK_MQTT_CLUSTER_PEERS_1: mqtt-node3:28883
+
+  mqtt-node2:
+    build: .
+    image: wcdk1024/wcdk-mqtt:1.0.0
+    container_name: wcdk-mqtt-node2
+    profiles: ["cluster"]
+    restart: unless-stopped
+    ports:
+      - "38083:38082"
+      - "1884:1883"
+      - "28884:28883"
+    environment:
+      TZ: Asia/Shanghai
+      WCDK_MQTT_SECURITY_CONSOLE-USERNAME: admin
+      WCDK_MQTT_SECURITY_CONSOLE-PASSWORD: admin
+      WCDK_MQTT_CLUSTER_ENABLED: "true"
+      WCDK_MQTT_CLUSTER_NODE-ID: node-2
+      WCDK_MQTT_CLUSTER_BIND-HOST: 0.0.0.0
+      WCDK_MQTT_CLUSTER_BIND-PORT: 28883
+      WCDK_MQTT_CLUSTER_ADVERTISE-HOST: mqtt-node2
+      WCDK_MQTT_CLUSTER_PEERS_0: mqtt-node1:28883
+      WCDK_MQTT_CLUSTER_PEERS_1: mqtt-node3:28883
+
+  mqtt-node3:
+    build: .
+    image: wcdk1024/wcdk-mqtt:1.0.0
+    container_name: wcdk-mqtt-node3
+    profiles: ["cluster"]
+    restart: unless-stopped
+    ports:
+      - "38084:38082"
+      - "1885:1883"
+      - "28885:28883"
+    environment:
+      TZ: Asia/Shanghai
+      WCDK_MQTT_SECURITY_CONSOLE-USERNAME: admin
+      WCDK_MQTT_SECURITY_CONSOLE-PASSWORD: admin
+      WCDK_MQTT_CLUSTER_ENABLED: "true"
+      WCDK_MQTT_CLUSTER_NODE-ID: node-3
+      WCDK_MQTT_CLUSTER_BIND-HOST: 0.0.0.0
+      WCDK_MQTT_CLUSTER_BIND-PORT: 28883
+      WCDK_MQTT_CLUSTER_ADVERTISE-HOST: mqtt-node3
+      WCDK_MQTT_CLUSTER_PEERS_0: mqtt-node1:28883
+      WCDK_MQTT_CLUSTER_PEERS_1: mqtt-node2:28883

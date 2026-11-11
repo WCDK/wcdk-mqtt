@@ -1,307 +1,173 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>wcdk-MQTT 控制台</title>
-    <link rel="stylesheet" href="/vendor/element-ui/theme-chalk/index.css">
-    <style>
-        :root {
-            color-scheme: light;
-        }
-
-        * {
-            box-sizing: border-box;
-        }
-
-        body {
-            margin: 0;
-            font-family: "Helvetica Neue", Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
-            background: #f5f7fa;
-            color: #303133;
-        }
-
-        [v-cloak] {
-            display: none;
-        }
-
-        .layout {
-            min-height: 100vh;
-        }
-
-        .topbar {
-            height: 56px;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            padding: 0 20px;
-            background: #ffffff;
-            border-bottom: 1px solid #e4e7ed;
-        }
-
-        .topbar-title {
-            display: flex;
-            align-items: center;
-            gap: 12px;
-            min-width: 0;
-        }
-
-        .topbar-title h1 {
-            margin: 0;
-            font-size: 18px;
-            font-weight: 600;
-            white-space: nowrap;
-        }
-
-        .topbar-meta {
-            color: #909399;
-            font-size: 13px;
-            white-space: nowrap;
-        }
-
-        .topbar-actions {
-            display: flex;
-            align-items: center;
-            gap: 10px;
-        }
-
-        .content {
-            padding: 16px;
-        }
-
-        .metric-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
-            gap: 12px;
-            margin-bottom: 16px;
-        }
-
-        .metric-card {
-            background: #ffffff;
-            border: 1px solid #e4e7ed;
-            border-radius: 8px;
-            padding: 14px 16px;
-            min-height: 96px;
-            display: flex;
-            flex-direction: column;
-            justify-content: space-between;
-        }
-
-        .metric-label {
-            color: #909399;
-            font-size: 13px;
-            line-height: 1.4;
-        }
-
-        .metric-value {
-            font-size: 28px;
-            font-weight: 600;
-            line-height: 1.1;
-            color: #303133;
-        }
-
-        .metric-foot {
-            color: #606266;
-            font-size: 12px;
-            line-height: 1.4;
-        }
-
-        .panel {
-            background: #ffffff;
-            border: 1px solid #e4e7ed;
-            border-radius: 8px;
-            margin-bottom: 16px;
-        }
-
-        .panel-header {
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 12px;
-            padding: 14px 16px;
-            border-bottom: 1px solid #ebeef5;
-        }
-
-        .panel-title {
-            margin: 0;
-            font-size: 15px;
-            font-weight: 600;
-        }
-
-        .panel-body {
-            padding: 16px;
-        }
-
-        .toolbar {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 10px;
-            align-items: center;
-        }
-
-        .compact-form .el-form-item {
-            margin-bottom: 14px;
-        }
-
-        .status-stack {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 8px;
-        }
-
-        .subscription-tags {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 6px;
-        }
-
-        .empty-note {
-            color: #909399;
-            font-size: 13px;
-        }
-
-        .message-payload {
-            max-width: 100%;
-            white-space: pre-wrap;
-            word-break: break-word;
-            line-height: 1.5;
-        }
-
-        .table-pagination {
-            display: flex;
-            justify-content: flex-end;
-            margin-top: 16px;
-        }
-
-        .section-grid {
-            display: grid;
-            grid-template-columns: minmax(320px, 420px) minmax(0, 1fr);
-            gap: 16px;
-            align-items: start;
-        }
-
-        .mono {
-            font-family: Consolas, "SFMono-Regular", monospace;
-        }
-
-        @media (max-width: 1100px) {
-            .section-grid {
-                grid-template-columns: 1fr;
-            }
-        }
-
-        @media (max-width: 768px) {
-            .topbar {
-                height: auto;
-                padding: 12px 16px;
-                align-items: flex-start;
-                flex-direction: column;
-                gap: 12px;
-            }
-
-            .topbar-title {
-                width: 100%;
-                flex-wrap: wrap;
-            }
-
-            .topbar-actions {
-                width: 100%;
-                justify-content: flex-start;
-                flex-wrap: wrap;
-            }
-
-            .content {
-                padding: 12px;
-            }
-
-            .metric-grid {
-                grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
-            }
-        }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MQTT Broker 控制台</title>
+<link rel="stylesheet" href="/css/console.css">
 </head>
 <body>
-<div id="app" class="layout" v-cloak>
-    <app-header
-            :overview="overview"
-            :broker-address="brokerAddress"
-            :settings="settings"
-            :loading="loading"
-            :active-panel="activePanel"
-            @refresh="refreshAll"
-            @toggle-panel="togglePanel">
-    </app-header>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo">MQTT</span>
+    <span class="title">Broker 控制台</span>
+  </div>
+  <div class="topbar-right">
+    <span class="live-state" id="liveState">实时连接中…</span>
+    <span class="user" id="currentUser">—</span>
+    <a class="logout" href="/logout">退出登录</a>
+  </div>
+</header>
 
-    <main class="content">
-        <template v-if="activePanel === 'main'">
-            <metric-cards :overview="overview"></metric-cards>
+<nav class="tabs">
+  <button class="tab active" data-tab="overview">概览</button>
+  <button class="tab" data-tab="clients">客户端</button>
+  <button class="tab" data-tab="messages">消息</button>
+  <button class="tab" data-tab="retained">保留消息</button>
+  <button class="tab" data-tab="cluster">集群</button>
+  <button class="tab" data-tab="publish">发布消息</button>
+</nav>
 
-            <section class="section-grid">
-                <div>
-                    <publish-panel
-                            :form="publishForm"
-                            :loading="loading.publish"
-                            @submit="publishMessage">
-                    </publish-panel>
+<main>
+  <!-- 概览 -->
+  <section class="panel active" id="panel-overview">
+    <div class="cards" id="overviewCards"></div>
+    <div class="box">
+      <div class="box-title">最近会话事件</div>
+      <table class="table">
+        <thead>
+        <tr><th>时间</th><th>动作</th><th>客户端 ID</th><th>用户名</th><th>来源节点</th><th>远端地址</th></tr>
+        </thead>
+        <tbody id="sessionEvents"></tbody>
+      </table>
+    </div>
+  </section>
 
-                    <subscriptions-panel
-                            :subscriptions="subscriptions"
-                            :loading="loading.subscriptions"
-                            :subscription-input-state="subscriptionInputState"
-                            @submit="addSubscription"
-                            @remove="removeSubscription">
-                    </subscriptions-panel>
+  <!-- 客户端 -->
+  <section class="panel" id="panel-clients">
+    <div class="toolbar">
+      <input type="text" id="clientKeyword" placeholder="按客户端 ID 或用户名搜索">
+      <select id="clientOnline">
+        <option value="">全部状态</option>
+        <option value="true">仅在线</option>
+        <option value="false">仅离线</option>
+      </select>
+      <button id="clientSearch">查询</button>
+      <span class="tip">删除操作会强制断开连接，勾选「同时清除会话」将移除会话状态</span>
+    </div>
+    <div class="box">
+      <table class="table">
+        <thead>
+        <tr>
+          <th>客户端 ID</th><th>用户名</th><th>状态</th><th>来源</th><th>属主节点</th>
+          <th>远端地址</th><th>KeepAlive</th><th>订阅数</th><th>离线队列</th><th>待确认</th><th>操作</th>
+        </tr>
+        </thead>
+        <tbody id="clientRows"></tbody>
+      </table>
+    </div>
+    <div class="box" id="subscriptionBox" hidden>
+      <div class="box-title">订阅明细：<span id="subscriptionOwner"></span></div>
+      <table class="table">
+        <thead><tr><th>主题过滤器</th><th>QoS</th></tr></thead>
+        <tbody id="subscriptionRows"></tbody>
+      </table>
+    </div>
+  </section>
 
-                    <broker-config-panel :overview="overview"></broker-config-panel>
-                </div>
+  <!-- 消息 -->
+  <section class="panel" id="panel-messages">
+    <div class="toolbar">
+      <input type="text" id="msgTopic" placeholder="主题过滤器，如 sensors/#">
+      <select id="msgQos">
+        <option value="">全部 QoS</option>
+        <option value="0">QoS 0</option>
+        <option value="1">QoS 1</option>
+        <option value="2">QoS 2</option>
+      </select>
+      <button id="msgSearch">查询</button>
+      <label class="check"><input type="checkbox" id="msgLive" checked>实时追加</label>
+      <button class="danger" id="msgClear">清空</button>
+    </div>
+    <div class="box">
+      <table class="table">
+        <thead>
+        <tr><th>时间</th><th>主题</th><th>QoS</th><th>保留</th><th>负载</th><th>命中订阅</th></tr>
+        </thead>
+        <tbody id="messageRows"></tbody>
+      </table>
+    </div>
+  </section>
 
-                <div>
-                    <clients-panel
-                            :clients="filteredClients"
-                            :loading="loading.clients"
-                            :client-filters="clientFilters">
-                    </clients-panel>
+  <!-- 保留消息 -->
+  <section class="panel" id="panel-retained">
+    <div class="toolbar">
+      <button id="retainedRefresh">刷新</button>
+      <span class="tip">删除保留消息会向集群同步空负载消息</span>
+    </div>
+    <div class="box">
+      <table class="table">
+        <thead><tr><th>主题</th><th>QoS</th><th>负载</th><th>操作</th></tr></thead>
+        <tbody id="retainedRows"></tbody>
+      </table>
+    </div>
+  </section>
 
-                    <messages-panel
-                            :messages="messages"
-                            :loading="loading"
-                            :filters="messageFilters"
-                            :page-no="messagePagination.pageNo"
-                            :page-size="messagePagination.pageSize"
-                            :total="messagePagination.total"
-                            @search="reloadMessages"
-                            @clear="clearMessages"
-                            @delete-selected="deleteSelectedMessages"
-                            @delete-by-filter="deleteMessagesByFilter"
-                            @delete-all="deleteAllMessages"
-                            @page-change="handleMessagePageChange"
-                            @page-size-change="handleMessagePageSizeChange">
-                    </messages-panel>
-                </div>
-            </section>
-        </template>
+  <!-- 集群 -->
+  <section class="panel" id="panel-cluster">
+    <div class="cards" id="clusterCards"></div>
+    <div class="box">
+      <div class="box-title">对等节点</div>
+      <table class="table">
+        <thead>
+        <tr><th>节点 ID</th><th>地址</th><th>状态</th><th>拨号方向</th><th>最后活跃</th></tr>
+        </thead>
+        <tbody id="clusterRows"></tbody>
+      </table>
+    </div>
+    <div class="box">
+      <div class="box-title">配置的对等地址</div>
+      <div class="peer-list" id="configuredPeers"></div>
+    </div>
+  </section>
 
-        <template v-if="activePanel === 'cluster'">
-            <cluster-panel
-                    :cluster-nodes="clusterNodes"
-                    :cluster-config="clusterConfig"
-                    :cluster-stats="clusterStats"
-                    :loading="loading.cluster">
-            </cluster-panel>
-        </template>
-    </main>
-</div>
+  <!-- 发布 -->
+  <section class="panel" id="panel-publish">
+    <div class="box narrow">
+      <div class="box-title">发布消息</div>
+      <div class="form-row">
+        <label>主题 *</label>
+        <input type="text" id="pubTopic" placeholder="如 sensors/temperature">
+      </div>
+      <div class="form-row">
+        <label>负载</label>
+        <textarea id="pubPayload" rows="5" placeholder="消息内容（文本）"></textarea>
+      </div>
+      <div class="form-row inline">
+        <label>负载编码</label>
+        <select id="pubEncoding">
+          <option value="text">文本（UTF-8）</option>
+          <option value="base64">Base64</option>
+        </select>
+        <label>QoS</label>
+        <select id="pubQos">
+          <option value="0">0</option>
+          <option value="1">1</option>
+          <option value="2">2</option>
+        </select>
+        <label class="check"><input type="checkbox" id="pubRetained">保留消息</label>
+      </div>
+      <div class="form-row">
+        <label>目标客户端 ID（可选，点对点投递）</label>
+        <input type="text" id="pubClientId" placeholder="留空则按主题路由">
+      </div>
+      <button id="pubSubmit">发 布</button>
+      <div class="form-result" id="pubResult"></div>
+    </div>
+  </section>
+</main>
 
-<script src="/vendor/vue/vue.min.js"></script>
-<script src="/vendor/element-ui/index.js"></script>
-<script src="/js/components/app-header.js"></script>
-<script src="/js/components/metric-cards.js"></script>
-<script src="/js/components/publish-panel.js"></script>
-<script src="/js/components/subscriptions-panel.js"></script>
-<script src="/js/components/broker-config-panel.js"></script>
-<script src="/js/components/clients-panel.js"></script>
-<script src="/js/components/messages-panel.js"></script>
-<script src="/js/components/cluster-panel.js"></script>
-<script src="/js/app.js"></script>
+<div class="toast" id="toast"></div>
+<script src="/app.js"></script>
 </body>
 </html>

@@ -1,103 +1,60 @@
 server:
-  port: ${SERVER_PORT:38082}
-  servlet:
-    encoding:
-      charset: ${SERVER_CHARSET:UTF-8}
-      enabled: true
-      force: true
+  port: 38082
+  shutdown: graceful
 
 spring:
-  autoconfigure:
-    exclude:
-      - org.springframework.boot.autoconfigure.jdbc.DataSourceAutoConfiguration
-      - org.springframework.boot.autoconfigure.r2dbc.R2dbcAutoConfiguration
-      - org.springframework.boot.autoconfigure.data.r2dbc.R2dbcDataAutoConfiguration
-      - org.springframework.boot.autoconfigure.data.r2dbc.R2dbcRepositoriesAutoConfiguration
-  main:
-    banner-mode: off
-    web-application-type: reactive
   application:
-    name: ${SPRING_APPLICATION_NAME:wcdk-mqtt-service}
-knife4j:
-  enable: ${KNIFE4J_ENABLE:true}
-
-springdoc:
-  api-docs:
-    enabled: ${SPRINGDOC_API_DOCS_ENABLED:true}
-  swagger-ui:
-    enabled: ${SPRINGDOC_SWAGGER_UI_ENABLED:true}
+    name: wcdk-mqtt
+  lifecycle:
+    timeout-per-shutdown-phase: 10s
 
 wcdk:
-  swagger:
-    title: ${WCDK_SWAGGER_TITLE:wcdk-mqtt-service 接口文档}
-    description: ${WCDK_SWAGGER_DESCRIPTION:wcdk-mqtt-service MQTT 服务接口文档}
-    version: ${WCDK_SWAGGER_VERSION:1.0}
-  r2dbc:
-    enabled: ${WCDK_R2DBC_ENABLED:false}
   mqtt:
+    # MQTT 接入配置
     broker:
-      enabled: ${MQTT_BROKER_ENABLED:true}
-      boss-threads: ${MQTT_BOSS_THREADS:1}
-      worker-threads: ${MQTT_WORKER_THREADS:0}
-      backlog: ${MQTT_BACKLOG:1024}
-      host: ${MQTT_BROKER_ADVERTISE_HOST:0.0.0.0}
-      port: ${MQTT_BROKER_PORT:1883}
-      max-payload-size: ${MQTT_MAX_PAYLOAD_SIZE:1048576}
-      max-client-id-length: ${MQTT_MAX_CLIENT_ID_LENGTH:128}
-      anonymous: ${MQTT_ANONYMOUS:true}
-      username: ${MQTT_USERNAME:admin}
-      password: ${MQTT_PASSWORD:wcdk@2026}
-      retained-messages: ${MQTT_RETAINED_MESSAGES:true}
-      persistence: ${MQTT_PERSISTENCE:true}
-      delivery-ack-enabled: ${MQTT_DELIVERY_ACK_ENABLED:true}
-      client-ack-enabled: ${MQTT_CLIENT_ACK_ENABLED:true}
-      cluster:
-        enabled: ${MQTT_CLUSTER_ENABLED:true}
-        heartbeat-interval-millis: ${MQTT_CLUSTER_HEARTBEAT_INTERVAL:1000}
-        node-timeout-millis: ${MQTT_CLUSTER_NODE_TIMEOUT:10000}
-        node-id: ${MQTT_CLUSTER_NODE_ID:}
-        role: ${MQTT_CLUSTER_ROLE:MASTER}
-        master: ${MQTT_CLUSTER_MASTER:}
-        channel: ${MQTT_CLUSTER_CHANNEL:tcp}
-        bind-host: ${MQTT_CLUSTER_BIND_HOST:0.0.0.0}
-        bind-port: ${MQTT_CLUSTER_BIND_PORT:28883}
-        global-session: ${MQTT_CLUSTER_GLOBAL_SESSION:false}
-        load-balance:
-          enabled: ${MQTT_CLUSTER_LOAD_BALANCE_ENABLED:true}
-          include-master: ${MQTT_CLUSTER_LOAD_BALANCE_INCLUDE_MASTER:false}
-        username: ${MQTT_CLUSTER_USERNAME:admin}
-        password: ${MQTT_CLUSTER_PASSWORD:wcdk@2026}
-        peers:
-          - ${MQTT_CLUSTER_PEERS:127.0.0.1:28884}
-        delivery-ack-enabled: ${MQTT_CLUSTER_DELIVERY_ACK_ENABLED:true}
-        client-ack-enabled: ${MQTT_CLUSTER_CLIENT_ACK_ENABLED:true}
-      acl:
-        enabled: ${MQTT_ACL_ENABLED:false}
-        default-policy: ${MQTT_ACL_DEFAULT_POLICY:ALLOW}
-        rules:
-          - enabled: true
-            policy: DENY
-            action: PUBLISH
-            client-ids:
-              - blocked-*
-            topic-filters:
-              - wcdk/secure/#
-  influx:
-    enabled: ${INFLUX_ENABLED:true}
-    url: ${INFLUX_URL:http://172.21.32.1:8086}
-    token: ${INFLUX_TOKEN:}
-    org: ${INFLUX_ORG:wcdk}
-    bucket: ${INFLUX_BUCKET:wcdk-messages}
-    username: ${INFLUX_USERNAME:admin}
-    password: ${INFLUX_PASSWORD:wcdk@2026}
-    timeout-seconds: ${INFLUX_TIMEOUT_SECONDS:120}
-    batch-size: ${INFLUX_BATCH_SIZE:500}
-    flush-interval-ms: ${INFLUX_FLUSH_INTERVAL_MS:1000}
-    max-retries: ${INFLUX_MAX_RETRIES:1}
-    query-range: ${INFLUX_QUERY_RANGE:-7d}
+      enabled: true
+      host: 0.0.0.0
+      port: 1883
+      max-payload-size: 1048576
+      max-client-id-length: 128
+      retained-messages: true
+      offline-queue: true
+      max-offline-messages: 1000
+      retransmit-timeout-millis: 10000
+      max-retransmit-attempts: 3
+      sweep-interval-seconds: 5
+      message-log-capacity: 500
+    # 认证与控制台安全配置
+    security:
+      anonymous: true
+      username:
+      password:
+      console-username: admin
+      console-password: admin
+    # 访问控制列表，默认关闭
+    acl:
+      enabled: false
+      default-policy: allow
+      rules: []
+    # 集群配置：所有节点对等，无主从之分；单实例保持 enabled=false
+    cluster:
+      enabled: false
+      node-id: node-1
+      bind-host: 0.0.0.0
+      bind-port: 28883
+      advertise-host:
+      peers: []
+      username:
+      password:
+      heartbeat-interval-millis: 5000
+      node-timeout-millis: 15000
+      reconnect-delay-millis: 3000
+    # 网页控制台
+    console:
+      enabled: true
+
 logging:
-  charset:
-    console: ${LOGGING_CHARSET_CONSOLE:UTF-8}
-    file: ${LOGGING_CHARSET_FILE:UTF-8}
   level:
-    com.wcdk.mqtt.core: ${LOGGING_LEVEL:INFO}
+    com.wcdk.mqtt: info
+    reactor.netty: warn
+    reactor.netty.channel: warn

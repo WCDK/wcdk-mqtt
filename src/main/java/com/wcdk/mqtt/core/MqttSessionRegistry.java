@@ -1,0 +1,650 @@
+package com.wcdk.mqtt.core;
+
+import java.util.ArrayList;
+import java.util.HashSet;
+import java.util.LinkedHashSet;
+import java.util.List;
+import java.util.Map;
+import java.util.Queue;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentLinkedQueue;
+
+import com.wcdk.mqtt.config.MqttProperties;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+/***
+* MQTT 会话注册表，负责会话注册销毁、消息本地路由与离线消息缓冲。
+* @author wcdk
+***/
+public class MqttSessionRegistry {
+
+    private static final Logger log = LoggerFactory.getLogger(MqttSessionRegistry.class);
+
+    private final MqttProperties properties;
+    private final MqttAcl acl;
+    private final MqttRetainedStore retainedStore;
+    private final List<MqttPublishListener> publishListeners = new ArrayList<>();
+    private final List<MqttSessionListener> sessionListeners = new ArrayList<>();
+
+    /** 本节点在线或离线的本地会话 */
+    private final Map<String, MqttSession> localSessions = new ConcurrentHashMap<>();
+    /** 其他节点同步来的会话快照，用于跨节点路由与离线缓冲 */
+    private final Map<String, MqttSession.SessionSnapshot> remoteSnapshots = new ConcurrentHashMap<>();
+    /** 已知但尚未接入本节点的持久会话离线缓冲 */
+    private final Map<String, Queue<MqttBrokerMessage>> pendingOffline = new ConcurrentHashMap<>();
+
+    /** 路由索引：过滤器首层字面量 → 该首层下的过滤器集合 */
+    private final Map<String, Set<String>> literalFilterIndex = new ConcurrentHashMap<>();
+    /** 路由索引：首层为 + 或 # 的通配过滤器集合 */
+    private final Set<String> wildcardFirstLevelFilters = ConcurrentHashMap.newKeySet();
+    /** 路由索引：过滤器 → 订阅该过滤器的客户端 ID 集合 */
+    private final Map<String, Set<String>> filterSubscribers = new ConcurrentHashMap<>();
+    /** 路由索引：客户端 ID → 已索引的过滤器集合，用于订阅变更与会话移除时的反向清理 */
+    private final Map<String, Set<String>> clientFilterIndex = new ConcurrentHashMap<>();
+    /** 路由索引维护锁：订阅变更低频，串行化增量重建以保证 diff 原子性，投递路径无锁读取 */
+    private final Object routingIndexLock = new Object();
+
+    public MqttSessionRegistry(MqttProperties properties,
+                               MqttAcl acl,
+                               MqttRetainedStore retainedStore) {
+        this.properties = properties;
+        this.acl = acl;
+        this.retainedStore = retainedStore;
+    }
+
+    /***
+    * 注册消息发布监听器，用于消息日志、集群广播与控制台事件。
+    * @author wcdk
+    * @param listener 监听器
+    ***/
+    public void addPublishListener(MqttPublishListener listener) {
+        if (listener != null) {
+            synchronized (publishListeners) {
+                publishListeners.add(listener);
+            }
+        }
+    }
+
+    /***
+    * 注册会话生命周期监听器，用于集群同步与控制台事件。
+    * @author wcdk
+    * @param listener 监听器
+    ***/
+    public void addSessionListener(MqttSessionListener listener) {
+        if (listener != null) {
+            synchronized (sessionListeners) {
+                sessionListeners.add(listener);
+            }
+        }
+    }
+
+    public MqttRetainedStore retainedStore() {
+        return retainedStore;
+    }
+
+    public MqttAcl acl() {
+        return acl;
+    }
+
+    /***
+    * 注册本地会话，处理同 clientId 重连时的状态恢复与旧连接接管。
+    * @author wcdk
+    * @param session 新会话
+    * @return 会话状态恢复成功返回 true
+    ***/
+    public boolean register(MqttSession session) {
+        boolean sessionPresent = false;
+        MqttSession previous = localSessions.get(session.clientId());
+        if (previous != null && previous != session) {
+            // 同一客户端重复接入，直接断开旧连接（接管属异常断开，旧连接会按规范发布遗嘱）
+            previous.closeConnection();
+            if (!session.cleanSession()) {
+                session.restoreStateFrom(previous);
+                sessionPresent = true;
+            }
+        } else if (!session.cleanSession()) {
+            // 本节点没有旧会话时，尝试从集群同步来的快照恢复
+            MqttSession.SessionSnapshot snapshot = remoteSnapshots.get(session.clientId());
+            if (snapshot != null && hasSessionState(snapshot)) {
+                session.restoreSnapshot(snapshot);
+                sessionPresent = true;
+            }
+        }
+        localSessions.put(session.clientId(), session);
+        session.setMaxOfflineCapacity(properties.getBroker().getMaxOfflineMessages());
+        // 消息已知但会话尚未接入时缓冲的离线消息在这里一次性冲刷
+        drainPendingOffline(session);
+        notifySessionChanged(session);
+        return sessionPresent;
+    }
+
+    private boolean hasSessionState(MqttSession.SessionSnapshot snapshot) {
+        return snapshot.isOnline()
+                || (snapshot.getSubscriptions() != null && !snapshot.getSubscriptions().isEmpty())
+                || (snapshot.getOutboundPending() != null && !snapshot.getOutboundPending().isEmpty());
+    }
+
+    private void drainPendingOffline(MqttSession session) {
+        Queue<MqttBrokerMessage> buffered = pendingOffline.remove(session.clientId());
+        if (buffered == null) {
+            return;
+        }
+        MqttBrokerMessage message;
+        while ((message = buffered.poll()) != null) {
+            int subscriptionQos = session.maxSubscriptionQos(message.topic());
+            if (subscriptionQos < 0) {
+                continue;
+            }
+            session.enqueueOffline(message, session.maxOfflineCapacity());
+        }
+        log.debug("已冲刷离线缓冲消息，客户端ID：{}，缓冲数量：{}", session.clientId(), buffered.size());
+    }
+
+    /***
+    * 释放本地会话持有的连接状态，持久会话保留为离线状态，清理会话从注册表移除。
+    * @author wcdk
+    * @param session 要释放的会话
+    * @return 被释放的会话，会话已被其他连接接管时返回 null
+    ***/
+    public MqttSession remove(MqttSession session) {
+        if (session == null) {
+            return null;
+        }
+        MqttSession current = localSessions.get(session.clientId());
+        if (current != session) {
+            return null;
+        }
+        session.detach();
+        if (session.persistsAfterDisconnect()) {
+            // 持久会话保留注册信息，继续为它缓冲离线消息，到过期时间由巡检移除
+            notifySessionChanged(session);
+        } else {
+            localSessions.remove(session.clientId(), session);
+            pendingOffline.remove(session.clientId());
+            remoteSnapshots.remove(session.clientId());
+            notifySessionRemoved(session);
+        }
+        return session;
+    }
+
+    /***
+    * 扫描并移除超过 MQTT5 会话过期时间的离线会话，同步清理其离线缓冲与远端快照。
+    * @author wcdk
+    * @return 本次过期移除的会话
+    ***/
+    public List<MqttSession> sweepExpiredSessions() {
+        long now = System.currentTimeMillis();
+        List<MqttSession> expired = new ArrayList<>();
+        for (MqttSession session : localSessions.values()) {
+            if (!session.isSessionExpired(now)) {
+                continue;
+            }
+            MqttSession current = localSessions.get(session.clientId());
+            if (current != session) {
+                continue;
+            }
+            localSessions.remove(session.clientId(), session);
+            pendingOffline.remove(session.clientId());
+            remoteSnapshots.remove(session.clientId());
+            session.detach();
+            notifySessionRemoved(session);
+            expired.add(session);
+        }
+        return expired;
+    }
+
+    /***
+    * 重建指定会话的路由索引：与既有索引做增量差集，保留未变更的过滤器，
+    * 避免"先清空再重建"的窗口内消息漏投递。
+    * @author wcdk
+    * @param session 会话
+    ***/
+    private void reindexSession(MqttSession session) {
+        if (session == null) {
+            return;
+        }
+        String clientId = session.clientId();
+        Set<String> currentFilters = new HashSet<>(session.subscriptionFilterNames());
+        synchronized (routingIndexLock) {
+            Set<String> indexedFilters = clientFilterIndex.get(clientId);
+            if (indexedFilters != null) {
+                for (String filter : indexedFilters) {
+                    if (!currentFilters.contains(filter)) {
+                        removeSubscriber(clientId, filter);
+                    }
+                }
+            }
+            for (String filter : currentFilters) {
+                if (indexedFilters == null || !indexedFilters.contains(filter)) {
+                    addSubscriber(clientId, filter);
+                }
+            }
+            if (currentFilters.isEmpty()) {
+                clientFilterIndex.remove(clientId);
+            } else {
+                clientFilterIndex.put(clientId, currentFilters);
+            }
+        }
+    }
+
+    /***
+    * 从路由索引移除指定客户端的全部订阅条目，会话销毁时调用。
+    * @author wcdk
+    * @param clientId 客户端 ID
+    ***/
+    private void removeFromRoutingIndex(String clientId) {
+        if (clientId == null) {
+            return;
+        }
+        synchronized (routingIndexLock) {
+            Set<String> indexedFilters = clientFilterIndex.remove(clientId);
+            if (indexedFilters == null) {
+                return;
+            }
+            for (String filter : indexedFilters) {
+                Set<String> clients = filterSubscribers.get(filter);
+                if (clients == null) {
+                    continue;
+                }
+                clients.remove(clientId);
+                if (clients.isEmpty() && filterSubscribers.remove(filter, clients)) {
+                    removeFromFirstLevelIndex(filter);
+                }
+            }
+        }
+    }
+
+    /** 登记订阅关系，调用方必须持有 routingIndexLock。 */
+    private void addSubscriber(String clientId, String filter) {
+        filterSubscribers.computeIfAbsent(filter, key -> ConcurrentHashMap.newKeySet()).add(clientId);
+        String firstLevel = MqttTopicMatcher.firstLevel(filter);
+        if ("+".equals(firstLevel) || "#".equals(firstLevel)) {
+            wildcardFirstLevelFilters.add(filter);
+        } else {
+            literalFilterIndex.computeIfAbsent(firstLevel, key -> ConcurrentHashMap.newKeySet()).add(filter);
+        }
+    }
+
+    /** 移除单条订阅关系，最后一个订阅者离开时同步清理首层索引，调用方必须持有 routingIndexLock。 */
+    private void removeSubscriber(String clientId, String filter) {
+        Set<String> clients = filterSubscribers.get(filter);
+        if (clients == null) {
+            return;
+        }
+        clients.remove(clientId);
+        if (clients.isEmpty() && filterSubscribers.remove(filter, clients)) {
+            removeFromFirstLevelIndex(filter);
+        }
+    }
+
+    private void removeFromFirstLevelIndex(String filter) {
+        String firstLevel = MqttTopicMatcher.firstLevel(filter);
+        if ("+".equals(firstLevel) || "#".equals(firstLevel)) {
+            wildcardFirstLevelFilters.remove(filter);
+            return;
+        }
+        Set<String> filters = literalFilterIndex.get(firstLevel);
+        if (filters != null) {
+            filters.remove(filter);
+            if (filters.isEmpty()) {
+                literalFilterIndex.remove(firstLevel, filters);
+            }
+        }
+    }
+
+    /***
+    * 按路由索引收集主题命中的过滤器：字面量首层哈希命中 + 少量通配首层候选，再做完整匹配校验。
+    * 相比对全部会话的全部订阅做 O(N×M) 扫描，仅遍历候选过滤器。
+    * @author wcdk
+    * @param topic 主题名称
+    * @return 完整匹配通过的过滤器集合
+    ***/
+    private Set<String> matchedCandidateFilters(String topic) {
+        Set<String> candidates = new LinkedHashSet<>();
+        Set<String> literal = literalFilterIndex.get(MqttTopicMatcher.firstLevel(topic));
+        if (literal != null) {
+            candidates.addAll(literal);
+        }
+        // $ 开头的系统主题不能被首层通配（+ / #）过滤器命中
+        if (topic.charAt(0) != '$' && !wildcardFirstLevelFilters.isEmpty()) {
+            candidates.addAll(wildcardFirstLevelFilters);
+        }
+        candidates.removeIf(filter -> !MqttTopicMatcher.matches(filter, topic));
+        return candidates;
+    }
+
+    /***
+    * 将消息路由到本节点所有命中的订阅者，并为离线持久会话缓冲。
+    * @author wcdk
+    * @param message 消息
+    * @return 本次投递命中的订阅过滤器（去重）
+    ***/
+    public List<String> deliver(MqttBrokerMessage message) {
+        if (message == null || !MqttTopicMatcher.isValidTopicName(message.topic())) {
+            return List.of();
+        }
+        if (properties.getBroker().isRetainedMessages()) {
+            retainedStore.store(message);
+        }
+        // 1. 索引定位命中的过滤器，再反查候选订阅者，避免遍历全部会话
+        Set<String> matchedFilters = matchedCandidateFilters(message.topic());
+        Set<String> candidateClients = new LinkedHashSet<>();
+        for (String filter : matchedFilters) {
+            Set<String> subscribers = filterSubscribers.get(filter);
+            if (subscribers != null) {
+                candidateClients.addAll(subscribers);
+            }
+        }
+        // 2. 按会话聚合最高订阅 QoS，每个会话只投递一次
+        Set<String> resultFilters = new LinkedHashSet<>();
+        for (String clientId : candidateClients) {
+            MqttSession session = localSessions.get(clientId);
+            if (session == null) {
+                continue;
+            }
+            int subscriptionQos = -1;
+            for (String filter : matchedFilters) {
+                Integer qos = session.subscriptionQos(filter);
+                if (qos != null && qos > subscriptionQos) {
+                    subscriptionQos = qos;
+                }
+            }
+            if (subscriptionQos < 0) {
+                // 索引残留（订阅已在未触发重建的路径上变更），以会话实际订阅为准
+                continue;
+            }
+            if (!acl.canSubscribe(session.username(), session.clientId(), message.topic())) {
+                continue;
+            }
+            for (String filter : matchedFilters) {
+                if (session.subscriptionQos(filter) != null) {
+                    resultFilters.add(filter);
+                }
+            }
+            int deliveryQos = MqttTopicMatcher.minQos(message.qos(), subscriptionQos);
+            session.sendPublish(message, deliveryQos, false);
+        }
+        // 为集群中已知的离线持久会话缓冲，等待其接入本节点或由属主节点投递
+        if (properties.getBroker().isOfflineQueue() && message.qos() > 0) {
+            bufferForRemoteSessions(message);
+        }
+        List<String> result = List.copyOf(resultFilters);
+        for (MqttPublishListener listener : publishListenerSnapshot()) {
+            listener.onPublish(message, result);
+        }
+        return result;
+    }
+
+    private List<MqttPublishListener> publishListenerSnapshot() {
+        synchronized (publishListeners) {
+            return List.copyOf(publishListeners);
+        }
+    }
+
+    private List<MqttSessionListener> sessionListenerSnapshot() {
+        synchronized (sessionListeners) {
+            return List.copyOf(sessionListeners);
+        }
+    }
+
+    private void bufferForRemoteSessions(MqttBrokerMessage message) {
+        for (Map.Entry<String, MqttSession.SessionSnapshot> entry : remoteSnapshots.entrySet()) {
+            MqttSession.SessionSnapshot snapshot = entry.getValue();
+            if (snapshot == null || !snapshot.persistsAfterDisconnect() || snapshot.isOnline()) {
+                continue;
+            }
+            if (localSessions.containsKey(entry.getKey())) {
+                continue;
+            }
+            if (!matchesAnySubscription(snapshot.getSubscriptions(), message.topic())) {
+                continue;
+            }
+            Queue<MqttBrokerMessage> queue = pendingOffline.computeIfAbsent(entry.getKey(),
+                    key -> new ConcurrentLinkedQueue<>());
+            queue.add(message);
+            int maxCapacity = Math.max(1, properties.getBroker().getMaxOfflineMessages());
+            int overflow = queue.size() - maxCapacity;
+            for (int i = 0; i < overflow; i++) {
+                queue.poll();
+            }
+        }
+    }
+
+    private boolean matchesAnySubscription(Map<String, Integer> subscriptions, String topic) {
+        if (subscriptions == null || subscriptions.isEmpty()) {
+            return false;
+        }
+        for (String filter : subscriptions.keySet()) {
+            if (!MqttTopicMatcher.maybeMatches(filter, topic)) {
+                continue;
+            }
+            if (MqttTopicMatcher.matches(filter, topic)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /***
+    * 向新订阅者补发匹配的保留消息。
+    * @author wcdk
+    * @param session 订阅者会话
+    * @param topicFilter 主题过滤器
+    * @param subscriptionQos 订阅 QoS
+    ***/
+    public void sendRetained(MqttSession session, String topicFilter, int subscriptionQos) {
+        if (!properties.getBroker().isRetainedMessages() || session == null) {
+            return;
+        }
+        for (MqttBrokerMessage retained : retainedStore.findByFilter(topicFilter)) {
+            if (!acl.canSubscribe(session.username(), session.clientId(), retained.topic())) {
+                continue;
+            }
+            int deliveryQos = MqttTopicMatcher.minQos(retained.qos(), subscriptionQos);
+            session.sendPublish(retained, deliveryQos, true);
+        }
+    }
+
+    /***
+    * 扫描 Keep Alive 超时的会话。
+    * @author wcdk
+    * @return 超时会话列表
+    ***/
+    public List<MqttSession> sweepIdleSessions() {
+        List<MqttSession> expired = new ArrayList<>();
+        long now = System.currentTimeMillis();
+        for (MqttSession session : localSessions.values()) {
+            int keepAlive = session.keepAliveSeconds();
+            if (keepAlive <= 0 || !session.isActive()) {
+                continue;
+            }
+            // 规范要求 1.5 倍 Keep Alive 未收到报文即断开
+            long timeoutMillis = keepAlive * 1500L;
+            if (now - session.lastActivityTime() > timeoutMillis) {
+                expired.add(session);
+            }
+        }
+        return expired;
+    }
+
+    /***
+    * 扫描出站超时未确认的消息用于重投。
+    * @author wcdk
+    * @param timeoutMillis 确认超时毫秒
+    * @return 需要重投的会话列表
+    ***/
+    public List<MqttSession> sweepPendingOutbound(long timeoutMillis) {
+        List<MqttSession> result = new ArrayList<>();
+        long now = System.currentTimeMillis();
+        for (MqttSession session : localSessions.values()) {
+            if (!session.isActive()) {
+                continue;
+            }
+            for (MqttSession.PendingOutbound pending : session.outboundPendingSnapshot()) {
+                if (now - pending.createdAt() > timeoutMillis) {
+                    result.add(session);
+                    break;
+                }
+            }
+        }
+        return result;
+    }
+
+    public Map<String, MqttSession> localSessions() {
+        return localSessions;
+    }
+
+    public List<MqttSession> sessions() {
+        return List.copyOf(localSessions.values());
+    }
+
+    public MqttSession findByClientId(String clientId) {
+        return clientId == null ? null : localSessions.get(clientId);
+    }
+
+    public int activeSessionCount() {
+        int count = 0;
+        for (MqttSession session : localSessions.values()) {
+            if (session.isActive()) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    public int sessionCount() {
+        return localSessions.size();
+    }
+
+    /***
+    * 更新集群同步来的远端会话快照。
+    * @author wcdk
+    * @param snapshot 会话快照
+    ***/
+    public void putRemoteSnapshot(MqttSession.SessionSnapshot snapshot) {
+        if (snapshot == null || snapshot.getClientId() == null) {
+            return;
+        }
+        if (localSessions.containsKey(snapshot.getClientId())) {
+            return;
+        }
+        remoteSnapshots.put(snapshot.getClientId(), snapshot);
+    }
+
+    /***
+    * 移除远端会话快照及其离线缓冲。
+    * @author wcdk
+    * @param clientId 客户端 ID
+    ***/
+    public void removeRemoteSnapshot(String clientId) {
+        if (clientId == null) {
+            return;
+        }
+        remoteSnapshots.remove(clientId);
+        pendingOffline.remove(clientId);
+    }
+
+    /***
+    * 管理接口强制移除本地会话（含持久会话），调用前应先断开连接。
+    * @author wcdk
+    * @param clientId 客户端 ID
+    * @return 本地存在该会话返回 true
+    ***/
+    public boolean forceRemove(String clientId) {
+        if (clientId == null || clientId.isBlank()) {
+            return false;
+        }
+        MqttSession session = localSessions.remove(clientId.trim());
+        if (session == null) {
+            return false;
+        }
+        session.detach();
+        pendingOffline.remove(clientId.trim());
+        notifySessionRemoved(session);
+        return true;
+    }
+
+    /***
+    * 释放被其他节点接管的本地会话副本：移除注册表条目与离线缓冲，
+    * 使本节点不再为该客户端缓存消息，避免客户端再次接入时重复投递。
+    * @author wcdk
+    * @param clientId 客户端 ID
+    * @return 本地存在该会话返回 true
+    ***/
+    public boolean releaseForClaim(String clientId) {
+        if (clientId == null || clientId.isBlank()) {
+            return false;
+        }
+        String id = clientId.trim();
+        MqttSession session = localSessions.remove(id);
+        pendingOffline.remove(id);
+        // 不触发 onSessionRemoved 广播（会话是迁移而非销毁），但必须清理本地路由索引
+        removeFromRoutingIndex(id);
+        if (session == null) {
+            return false;
+        }
+        session.detach();
+        // 不触发 onSessionRemoved 广播：会话并未销毁而是迁移，广播 SESSION_REMOVE
+        // 会误删其他节点刚同步来的远端快照
+        return true;
+    }
+
+    /***
+    * 清空指定客户端的离线缓冲，会话在其他节点上线时调用。
+    * @author wcdk
+    * @param clientId 客户端 ID
+    ***/
+    public void clearPendingOffline(String clientId) {
+        if (clientId != null) {
+            pendingOffline.remove(clientId);
+        }
+    }
+
+    public Map<String, MqttSession.SessionSnapshot> remoteSnapshots() {
+        return remoteSnapshots;
+    }
+
+    public int remoteSnapshotCount() {
+        return remoteSnapshots.size();
+    }
+
+    public int pendingOfflineCount() {
+        return pendingOffline.size();
+    }
+
+    /***
+    * 通知全部会话监听器（订阅等状态变化时由协议层触发集群同步）。
+    * @author wcdk
+    * @param session 会话
+    ***/
+    public void notifySessionChanged(MqttSession session) {
+        if (session != null) {
+            // 订阅等状态变化先重建路由索引，再广播给集群（索引重建不依赖监听器存在）
+            reindexSession(session);
+        }
+        for (MqttSessionListener listener : sessionListenerSnapshot()) {
+            try {
+                listener.onSessionChanged(session);
+            } catch (RuntimeException ex) {
+                log.warn("会话变更监听器执行失败，客户端ID：{}，异常信息：{}",
+                        session.clientId(), ex.getMessage());
+            }
+        }
+    }
+
+    private void notifySessionRemoved(MqttSession session) {
+        if (session != null) {
+            removeFromRoutingIndex(session.clientId());
+        }
+        for (MqttSessionListener listener : sessionListenerSnapshot()) {
+            try {
+                listener.onSessionRemoved(session);
+            } catch (RuntimeException ex) {
+                log.warn("会话移除监听器执行失败，客户端ID：{}，异常信息：{}",
+                        session.clientId(), ex.getMessage());
+            }
+        }
+    }
+}
