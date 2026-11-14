@@ -5,9 +5,13 @@ import java.util.NoSuchElementException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.HttpStatusCode;
 import org.springframework.http.ResponseEntity;
+import org.springframework.util.StringUtils;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.reactive.resource.NoResourceFoundException;
+import org.springframework.web.server.ResponseStatusException;
 import reactor.core.publisher.Mono;
 
 /***
@@ -29,6 +33,33 @@ public class GlobalExceptionHandler {
     public Mono<ResponseEntity<ApiResponse<Void>>> handleNotFound(NoSuchElementException ex) {
         return Mono.just(ResponseEntity.status(HttpStatus.NOT_FOUND)
                 .body(ApiResponse.fail(404, ex.getMessage() == null ? "资源不存在" : ex.getMessage())));
+    }
+
+    /***
+    * 静态资源或接口路径不存在映射为 404，避免被包装成 500 误导排查。
+    * @author wcdk
+    * @param ex 异常
+    * @return 404 响应
+    ***/
+    @ExceptionHandler(NoResourceFoundException.class)
+    public Mono<ResponseEntity<ApiResponse<Void>>> handleNoResource(NoResourceFoundException ex) {
+        String resource = resourcePath(ex);
+        return Mono.just(ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(ApiResponse.fail(404, resource.isEmpty() ? "请求的资源不存在" : "请求的资源不存在：" + resource)));
+    }
+
+    /***
+    * 框架状态码异常保持原状态码返回，不再统一降级为 500。
+    * @author wcdk
+    * @param ex 异常
+    * @return 原状态码响应
+    ***/
+    @ExceptionHandler(ResponseStatusException.class)
+    public Mono<ResponseEntity<ApiResponse<Void>>> handleResponseStatus(ResponseStatusException ex) {
+        HttpStatusCode statusCode = ex.getStatusCode();
+        String reason = StringUtils.hasText(ex.getReason()) ? ex.getReason() : "请求处理失败";
+        return Mono.just(ResponseEntity.status(statusCode)
+                .body(ApiResponse.fail(statusCode.value(), reason)));
     }
 
     /***
@@ -54,5 +85,18 @@ public class GlobalExceptionHandler {
         log.error("管理接口处理异常：{}", ex.getMessage(), ex);
         return Mono.just(ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR)
                 .body(ApiResponse.fail(500, "服务内部错误：" + ex.getMessage())));
+    }
+
+    /***
+    * 从 NoResourceFoundException 的提示中解析缺失的资源路径。
+    * @author wcdk
+    * @param ex 异常
+    * @return 资源路径，无法解析时返回空串
+    ***/
+    private String resourcePath(NoResourceFoundException ex) {
+        String message = StringUtils.hasText(ex.getReason()) ? ex.getReason() : String.valueOf(ex.getMessage());
+        String prefix = "No static resource ";
+        String path = message.startsWith(prefix) ? message.substring(prefix.length()) : message;
+        return path.endsWith(".") ? path.substring(0, path.length() - 1) : path;
     }
 }

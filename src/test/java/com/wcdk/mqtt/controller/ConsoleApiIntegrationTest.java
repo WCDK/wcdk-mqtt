@@ -71,6 +71,73 @@ class ConsoleApiIntegrationTest {
                 .expectStatus().isOk()
                 .expectBody(String.class)
                 .value(body -> assertThat(body).contains("MQTT Broker 控制台"));
+
+        client.get().uri("/login")
+                .exchange()
+                .expectStatus().is3xxRedirection()
+                .expectHeader().valueEquals(HttpHeaders.LOCATION, "/login.html");
+    }
+
+    /***
+    * 验证登录表单提交到 /login 时能被安全框架处理：凭据正确建立会话，凭据错误跳回错误页。
+    * @author wcdk
+    ***/
+    @Test
+    void formLoginShouldProcessPostToLoginUrl() {
+        var loginResult = client.post().uri("/login")
+                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                .bodyValue("username=admin&password=admin")
+                .exchange()
+                .expectStatus().is3xxRedirection()
+                .returnResult(Void.class);
+
+        assertThat(loginResult.getResponseHeaders().getFirst(HttpHeaders.LOCATION)).isEqualTo("/");
+        String sessionCookie = extractCookie(loginResult);
+        assertThat(sessionCookie).isNotBlank();
+
+        client.get().uri("/api/overview")
+                .header(HttpHeaders.COOKIE, sessionCookie)
+                .exchange()
+                .expectStatus().isOk()
+                .expectBody()
+                .jsonPath("$.code").isEqualTo(0);
+
+        client.post().uri("/login")
+                .contentType(MediaType.APPLICATION_FORM_URLENCODED)
+                .bodyValue("username=admin&password=wrong-password")
+                .exchange()
+                .expectStatus().is3xxRedirection()
+                .expectHeader().valueEquals(HttpHeaders.LOCATION, "/login.html?error");
+    }
+
+    /***
+    * 验证不存在的路径返回 404 JSON 而不是被包装成 500。
+    * @author wcdk
+    ***/
+    @Test
+    void unknownPathShouldReturn404Json() {
+        // 未认证访问任意页面先被引导到登录页，认证后不存在的路径才返回 404 JSON
+        client.get().uri("/no-such-page")
+                .exchange()
+                .expectStatus().is3xxRedirection()
+                .expectHeader().valueEquals(HttpHeaders.LOCATION, "/login.html");
+
+        client.get().uri("/no-such-page")
+                .header(HttpHeaders.AUTHORIZATION, basicAuth("admin", "admin"))
+                .exchange()
+                .expectStatus().isNotFound()
+                .expectHeader().contentTypeCompatibleWith(MediaType.APPLICATION_JSON)
+                .expectBody()
+                .jsonPath("$.code").isEqualTo(404)
+                .jsonPath("$.message").value(value ->
+                        assertThat(String.valueOf(value)).contains("no-such-page"));
+
+        client.get().uri("/api/no-such-endpoint")
+                .header(HttpHeaders.AUTHORIZATION, basicAuth("admin", "admin"))
+                .exchange()
+                .expectStatus().isNotFound()
+                .expectBody()
+                .jsonPath("$.code").isEqualTo(404);
     }
 
     /***
@@ -184,5 +251,14 @@ class ConsoleApiIntegrationTest {
     private String basicAuth(String username, String password) {
         String token = username + ":" + password;
         return "Basic " + Base64.getEncoder().encodeToString(token.getBytes(StandardCharsets.UTF_8));
+    }
+
+    private String extractCookie(org.springframework.test.web.reactive.server.ExchangeResult result) {
+        String setCookie = result.getResponseHeaders().getFirst(HttpHeaders.SET_COOKIE);
+        if (setCookie == null) {
+            return "";
+        }
+        int semicolon = setCookie.indexOf(';');
+        return semicolon > 0 ? setCookie.substring(0, semicolon) : setCookie;
     }
 }

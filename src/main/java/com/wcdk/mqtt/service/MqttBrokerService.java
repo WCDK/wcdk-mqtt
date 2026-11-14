@@ -104,6 +104,24 @@ public class MqttBrokerService {
             }
             totalSubscriptions += session.subscriptions().size();
         }
+        // 远端会话快照（集群同步来的），计入未被本节点占据的会话
+        for (MqttSession.SessionSnapshot snapshot : registry.remoteSnapshots().values()) {
+            if (snapshot == null || snapshot.getClientId() == null) {
+                continue;
+            }
+            // 若本节点已有该 clientId 的活跃会话，远端快照不重复计入
+            if (registry.findByClientId(snapshot.getClientId()) != null) {
+                continue;
+            }
+            if (snapshot.isOnline()) {
+                activeSessions++;
+            } else {
+                offlineSessions++;
+            }
+            if (snapshot.getSubscriptions() != null) {
+                totalSubscriptions += snapshot.getSubscriptions().size();
+            }
+        }
         Overview overview = new Overview();
         overview.setStartedAt(startedAt);
         overview.setUptimeSeconds(java.time.Duration.between(startedAt, Instant.now()).toSeconds());

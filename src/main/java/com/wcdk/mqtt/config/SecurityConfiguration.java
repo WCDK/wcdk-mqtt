@@ -60,7 +60,13 @@ public class SecurityConfiguration {
                     response.getHeaders().setLocation(java.net.URI.create("/login.html"));
                     return response.setComplete();
                 }))
-                .formLogin(formLogin -> formLogin.loginPage("/login.html"))
+                // loginPage 会同时把表单提交地址绑定为该页面，需显式声明 /login 作为提交入口
+                .formLogin(formLogin -> formLogin
+                        .loginPage("/login.html")
+                        .requiresAuthenticationMatcher(
+                                org.springframework.security.web.server.util.matcher.ServerWebExchangeMatchers
+                                        .pathMatchers(org.springframework.http.HttpMethod.POST, "/login",
+                                                "/login.html")))
                 .logout(logout -> logout.logoutSuccessHandler(successHandler()))
                 .httpBasic(Customizer.withDefaults());
         return http.build();
