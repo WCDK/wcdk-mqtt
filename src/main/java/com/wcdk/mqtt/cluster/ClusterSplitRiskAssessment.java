@@ -1,7 +1,8 @@
 package com.wcdk.mqtt.cluster;
 
 import com.wcdk.mqtt.config.MqttProperties;
-import com.wcdk.mqtt.core.MqttSession;
+import lombok.Getter;
+
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -134,13 +135,13 @@ public class ClusterSplitRiskAssessment {
                 }
             }
             // 配置了对等节点但实际活动连接少，风险增加
-            if (configuredPeers.size() > 0 && activePeerCount < configuredPeers.size()) {
+            if (!configuredPeers.isEmpty() && activePeerCount < configuredPeers.size()) {
                 score += 15;
             }
         }
 
         // 确保分数在 0-100 范围内
-        return Math.min(Math.max(score, 0), 100);
+        return Math.clamp(score, 0, 100);
     }
 
     /**
@@ -202,34 +203,28 @@ public class ClusterSplitRiskAssessment {
      * 生成风险等级对应的防御建议
      */
     private String generateMitigationAdvice(RiskLevel riskLevel) {
-        switch (riskLevel) {
-            case EXTREME:
-                return "立即执行紧急恢复流程：\n" +
-                        "1. 检查网络链路是否中断或丢包严重\n" +
-                        "2. 重启失联的集群节点\n" +
-                        "3. 确保所有节点恢复网络连接后再恢复业务写入\n" +
-                        "4. 如有必要，人工介入清理可能的分区状态\n" +
-                        "5. 考虑暂时停止少数节点的写入业务，防止数据不一致";
-            case HIGH:
-                return "高风险预警：\n" +
-                        "1. 尽快排查导致心跳超时的网络原因\n" +
-                        "2. 重启或重新连接超时的节点\n" +
-                        "3. 在节点恢复前，谨慎进行新的持久化写入操作\n" +
-                        "4. 建议增大心跳间隔或调整节点超时阈值以适应网络抖动";
-            case MEDIUM:
-                return "中等风险提醒：\n" +
-                        "1. 关注网络状况变化趋势\n" +
-                        "2. 适当调大心跳间隔或节点超时时间以容忍短时网络波动\n" +
-                        "3. 检查是否有节点正在重启或进行网络切换";
-            case LOW:
-                return "低风险提示：\n" +
-                        "1. 关注连接率变化，特别是少于 50% 配置对等时\n" +
-                        "2. 正常监控网络状况即可，无需紧急行动";
-            case SAFE:
-            default:
-                return "安全：集群连接正常，脑裂风险极低。" +
-                        "建议保持当前配置，定期进行集群健康检查";
-        }
+        return switch (riskLevel) {
+            case EXTREME -> "立即执行紧急恢复流程：\n" +
+                    "1. 检查网络链路是否中断或丢包严重\n" +
+                    "2. 重启失联的集群节点\n" +
+                    "3. 确保所有节点恢复网络连接后再恢复业务写入\n" +
+                    "4. 如有必要，人工介入清理可能的分区状态\n" +
+                    "5. 考虑暂时停止少数节点的写入业务，防止数据不一致";
+            case HIGH -> "高风险预警：\n" +
+                    "1. 尽快排查导致心跳超时的网络原因\n" +
+                    "2. 重启或重新连接超时的节点\n" +
+                    "3. 在节点恢复前，谨慎进行新的持久化写入操作\n" +
+                    "4. 建议增大心跳间隔或调整节点超时阈值以适应网络抖动";
+            case MEDIUM -> "中等风险提醒：\n" +
+                    "1. 关注网络状况变化趋势\n" +
+                    "2. 适当调大心跳间隔或节点超时时间以容忍短时网络波动\n" +
+                    "3. 检查是否有节点正在重启或进行网络切换";
+            case LOW -> "低风险提示：\n" +
+                    "1. 关注连接率变化，特别是少于 50% 配置对等时\n" +
+                    "2. 正常监控网络状况即可，无需紧急行动";
+            default -> "安全：集群连接正常，脑裂风险极低。" +
+                    "建议保持当前配置，定期进行集群健康检查";
+        };
     }
 
     /**
@@ -281,6 +276,7 @@ public class ClusterSplitRiskAssessment {
     /**
      * 风险等级枚举
      */
+    @Getter
     public enum RiskLevel {
         SAFE("安全"), LOW("低风险"), MEDIUM("中风险"), HIGH("高风险"), EXTREME("极危");
 
@@ -290,80 +286,37 @@ public class ClusterSplitRiskAssessment {
             this.description = description;
         }
 
-        public String getDescription() {
-            return description;
-        }
     }
 
     /**
-     * 风险评估结果数据类
-     */
-    public static class RiskAssessmentResult {
-        private final int riskScore;
-        private final RiskLevel riskLevel;
-        private final List<String> riskFactors;
-        private final String mitigationAdvice;
-        private final Instant timestamp;
-        private final int connectedPeerCount;
-
-        public RiskAssessmentResult(int riskScore, RiskLevel riskLevel,
-                                    List<String> riskFactors, String mitigationAdvice,
-                                    Instant timestamp, int connectedPeerCount) {
-            this.riskScore = riskScore;
-            this.riskLevel = riskLevel;
-            this.riskFactors = riskFactors;
-            this.mitigationAdvice = mitigationAdvice;
-            this.timestamp = timestamp;
-            this.connectedPeerCount = connectedPeerCount;
-        }
-
-        public int getRiskScore() {
-            return riskScore;
-        }
-
-        public RiskLevel getRiskLevel() {
-            return riskLevel;
-        }
-
-        public List<String> getRiskFactors() {
-            return riskFactors;
-        }
-
-        public String getMitigationAdvice() {
-            return mitigationAdvice;
-        }
-
-        public Instant getTimestamp() {
-            return timestamp;
-        }
-
-        public int getConnectedPeerCount() {
-            return connectedPeerCount;
-        }
+         * 风险评估结果数据类
+         */
+        public record RiskAssessmentResult(int riskScore, RiskLevel riskLevel, List<String> riskFactors,
+                                           String mitigationAdvice, Instant timestamp, int connectedPeerCount) {
 
         public String getRiskScoreColor() {
-            if (riskScore >= 80) return "#d9534f";
-            if (riskScore >= 60) return "#f0ad4e";
-            if (riskScore >= 40) return "#5bc0de";
-            if (riskScore >= 20) return "#f0ad4e";
-            return "#5cb85c";
-        }
+                if (riskScore >= 80) return "#d9534f";
+                if (riskScore >= 60) return "#f0ad4e";
+                if (riskScore >= 40) return "#5bc0de";
+                if (riskScore >= 20) return "#f0ad4e";
+                return "#5cb85c";
+            }
 
-        public String getRiskLevelColor() {
-            if (riskLevel == RiskLevel.EXTREME) return "#d9534f";
-            if (riskLevel == RiskLevel.HIGH) return "#f0ad4e";
-            if (riskLevel == RiskLevel.MEDIUM) return "#f0ad4e";
-            if (riskLevel == RiskLevel.LOW) return "#f0ad4e";
-            return "#5cb85c";
-        }
+            public String getRiskLevelColor() {
+                if (riskLevel == RiskLevel.EXTREME) return "#d9534f";
+                if (riskLevel == RiskLevel.HIGH) return "#f0ad4e";
+                if (riskLevel == RiskLevel.MEDIUM) return "#f0ad4e";
+                if (riskLevel == RiskLevel.LOW) return "#f0ad4e";
+                return "#5cb85c";
+            }
 
-        @Override
-        public String toString() {
-            return "RiskAssessmentResult{" +
-                    "riskScore=" + riskScore +
-                    ", riskLevel=" + riskLevel +
-                    ", connectedPeerCount=" + connectedPeerCount +
-                    '}';
+            @Override
+            public String toString() {
+                return "RiskAssessmentResult{" +
+                        "riskScore=" + riskScore +
+                        ", riskLevel=" + riskLevel +
+                        ", connectedPeerCount=" + connectedPeerCount +
+                        '}';
+            }
         }
-    }
 }

@@ -1,11 +1,15 @@
 package com.wcdk.mqtt.cluster;
 
 import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.concurrent.Executor;
+import java.util.function.Supplier;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import io.netty.buffer.Unpooled;
+import lombok.Getter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import reactor.core.publisher.Sinks;
@@ -28,12 +32,18 @@ public class MqttClusterPeer {
     private final ObjectMapper objectMapper;
     private final String localNodeId;
     /** 本节点主动拨号建立返回 true，被动接受返回 false */
+    @Getter
     private final boolean dialed;
     /** 拨号目标地址 host:port，接受连接时为空 */
     private final String targetAddress;
     /** 出站汇聚点：有界缓冲，写满时断开该对等连接 */
     private final Sinks.Many<io.netty.buffer.ByteBuf> outboundSink =
             Sinks.many().unicast().onBackpressureBuffer(Queues.<io.netty.buffer.ByteBuf>get(OUTBOUND_BUFFER_LIMIT).get());
+    /**
+     * 出站有序队列：JSON/Base64 编码在线程池执行，队列保证同一连接的发送顺序，
+     * 避免编码工作占用 Reactor 事件循环。
+     */
+    private final SerialTaskQueue outboundQueue;
 
     /** 远端节点 ID，收到 HELLO 后填充 */
     private volatile String remoteNodeId;
@@ -42,24 +52,30 @@ public class MqttClusterPeer {
     /** 最后一次收到远端报文的时间 */
     private volatile long lastSeenMillis = System.currentTimeMillis();
     /** 是否已关闭 */
+    @Getter
     private volatile boolean closed;
+    /**
+     * 出站写入串行化锁：unicast Sink 不保证多生产者线程安全，
+     * 心跳、发布、会话同步、管理指令可能来自不同执行体，必须单写者化。
+     */
+    private final Object sendLock = new Object();
 
     MqttClusterPeer(Connection connection,
                     MqttClusterManager manager,
                     ObjectMapper objectMapper,
                     String localNodeId,
                     boolean dialed,
-                    String targetAddress) {
+                    String targetAddress,
+                    Executor outboundExecutor,
+                    int queueCapacity) {
         this.connection = connection;
         this.manager = manager;
         this.objectMapper = objectMapper;
         this.localNodeId = localNodeId;
         this.dialed = dialed;
         this.targetAddress = targetAddress;
-    }
-
-    public boolean isDialed() {
-        return dialed;
+        this.outboundQueue = new SerialTaskQueue(outboundExecutor, queueCapacity,
+                "peer-out-" + System.identityHashCode(this));
     }
 
     public String targetAddress() {
@@ -76,10 +92,6 @@ public class MqttClusterPeer {
 
     public long lastSeenMillis() {
         return lastSeenMillis;
-    }
-
-    public boolean isClosed() {
-        return closed;
     }
 
     /***
@@ -105,14 +117,53 @@ public class MqttClusterPeer {
 
     /***
     * 发送一条集群事件，编码为一行 JSON 字节。
+    * 事件先进入连接级有序队列，由共享线程池完成 JSON/Base64 编码后写出，
+    * 因此返回 true 仅表示“已接受发送”，不表示对端已收到。
     * @author wcdk
     * @param type 事件类型
     * @param payload 事件负载
     * @return 入队成功返回 true
     ***/
     public boolean send(ClusterEventType type, Map<String, Object> payload) {
-        if (closed) {
+        return send(type, () -> payload);
+    }
+
+    /***
+    * 发送一条集群事件，负载延迟到编码线程构造，避免 Base64/快照序列化占用调用线程。
+    * @author wcdk
+    * @param type 事件类型
+    * @param payloadSupplier 负载构造器，执行时不得返回 null
+    * @return 入队成功返回 true
+    ***/
+    public boolean send(ClusterEventType type, Supplier<Map<String, Object>> payloadSupplier) {
+        if (closed || type == null || payloadSupplier == null) {
             return false;
+        }
+        boolean accepted = outboundQueue.submit(() -> encodeAndEmit(type, payloadSupplier));
+        if (!accepted && !closed) {
+            log.warn("集群出站队列已满，断开对等连接，远端节点：{}，队列任务数：{}",
+                    remoteNodeId, outboundQueue.size());
+            close();
+        }
+        return accepted;
+    }
+
+    /***
+    * 在线程池中构造事件负载并编码为单行 JSON。
+    * @author wcdk
+    * @param type 事件类型
+    * @param payloadSupplier 负载构造器
+    ***/
+    private void encodeAndEmit(ClusterEventType type, Supplier<Map<String, Object>> payloadSupplier) {
+        if (closed) {
+            return;
+        }
+        Map<String, Object> payload;
+        try {
+            payload = payloadSupplier.get();
+        } catch (RuntimeException ex) {
+            log.warn("集群事件负载构造失败，事件类型：{}，异常信息：{}", type, ex.getMessage());
+            return;
         }
         ClusterEvent event = new ClusterEvent(type, localNodeId, payload);
         byte[] line;
@@ -120,28 +171,46 @@ public class MqttClusterPeer {
             line = objectMapper.writeValueAsBytes(event);
         } catch (Exception ex) {
             log.warn("集群事件序列化失败，事件类型：{}，异常信息：{}", type, ex.getMessage());
-            return false;
+            return;
         }
         // 末尾补换行符作为帧分隔
-        byte[] frame = java.util.Arrays.copyOf(line, line.length + 1);
+        byte[] frame = Arrays.copyOf(line, line.length + 1);
         frame[line.length] = '\n';
-        Sinks.EmitResult result = outboundSink.tryEmitNext(Unpooled.wrappedBuffer(frame));
-        // 序列化包装被其他线程短暂持锁时重试，避免事件因并发竞争被丢弃
-        for (int attempt = 0; attempt < 3 && result == Sinks.EmitResult.FAIL_NON_SERIALIZED; attempt++) {
-            Thread.yield();
-            result = outboundSink.tryEmitNext(Unpooled.wrappedBuffer(frame));
+        emitFrame(type, Unpooled.wrappedBuffer(frame));
+    }
+
+    /***
+    * 把编码后的帧写入出站汇聚点，失败时释放缓冲。
+    * @author wcdk
+    * @param type 事件类型
+    * @param buffer 编码后的帧
+    ***/
+    private void emitFrame(ClusterEventType type, io.netty.buffer.ByteBuf buffer) {
+        // 单写者串行化：unicast Sink 不保证多生产者线程安全
+        synchronized (sendLock) {
+            if (closed) {
+                buffer.release();
+                return;
+            }
+            Sinks.EmitResult result = outboundSink.tryEmitNext(buffer);
+            // 串行化后仍偶发非序列化失败时短暂重试，避免事件因竞争被丢弃
+            for (int attempt = 0; attempt < 10 && result == Sinks.EmitResult.FAIL_NON_SERIALIZED; attempt++) {
+                Thread.yield();
+                result = outboundSink.tryEmitNext(buffer);
+            }
+            if (result.isSuccess()) {
+                return;
+            }
+            // 未入队的缓冲必须释放，避免包装内存泄漏
+            buffer.release();
+            if (result == Sinks.EmitResult.FAIL_OVERFLOW) {
+                log.warn("集群出站缓冲写满，断开对等连接，远端节点：{}，缓冲上限：{}帧",
+                        remoteNodeId, OUTBOUND_BUFFER_LIMIT);
+                close();
+            } else {
+                log.warn("集群事件写出失败，事件类型：{}，远端节点：{}，原因：{}", type, remoteNodeId, result);
+            }
         }
-        if (result == Sinks.EmitResult.FAIL_OVERFLOW) {
-            log.warn("集群出站缓冲写满，断开对等连接，远端节点：{}，缓冲上限：{}帧",
-                    remoteNodeId, OUTBOUND_BUFFER_LIMIT);
-            close();
-            return false;
-        }
-        if (result.isFailure()) {
-            log.debug("集群事件写出失败，事件类型：{}，远端节点：{}，原因：{}", type, remoteNodeId, result);
-            return false;
-        }
-        return true;
     }
 
     /***
@@ -194,6 +263,7 @@ public class MqttClusterPeer {
             return;
         }
         closed = true;
+        outboundQueue.close();
         try {
             connection.dispose();
         } catch (RuntimeException ex) {
@@ -207,6 +277,7 @@ public class MqttClusterPeer {
     ***/
     void markClosed() {
         this.closed = true;
+        outboundQueue.close();
     }
 
     @Override

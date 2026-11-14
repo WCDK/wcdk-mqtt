@@ -181,6 +181,12 @@ public class MqttProperties {
 
         /** 对等节点断线重连间隔毫秒 */
         private long reconnectDelayMillis = 3000;
+
+        /** 集群编解码/事件处理线程数，0 表示按 CPU 自动计算（2–4） */
+        private int codecThreads;
+
+        /** 每个对等连接的待处理事件队列上限，溢出时断开连接并触发重新同步 */
+        private int eventQueueCapacity = 4096;
     }
 
     /***

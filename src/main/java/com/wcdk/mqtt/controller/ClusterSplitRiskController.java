@@ -6,7 +6,6 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
-import java.time.Instant;
 import java.util.Map;
 
 /**
@@ -53,7 +52,7 @@ public class ClusterSplitRiskController {
         Map<String, Object> response = new java.util.HashMap<>();
         response.put("success", true);
         response.put("data", result);
-        response.put("timestamp", result.getTimestamp().toString());
+        response.put("timestamp", result.timestamp().toString());
 
         // 添加节点详情
         Map<String, Object> nodeDetails = riskAssessment.getNodeDetails();

@@ -11,9 +11,15 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Supplier;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -43,6 +49,13 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
 
     private static final Logger log = LoggerFactory.getLogger(MqttClusterManager.class);
 
+    /** 新节点全量同步时每批下发的会话/保留消息数量，降低帧数与缓冲压力 */
+    private static final int STATE_SYNC_BATCH_SIZE = 100;
+
+    /** 集群编解码线程池默认线程数，配置为 0 时按 CPU 自动计算并限制在 2–4 */
+    private static final int DEFAULT_CODEC_THREADS = Math.max(2,
+            Math.min(4, Runtime.getRuntime().availableProcessors()));
+
     private final MqttProperties properties;
     private final MqttSessionRegistry registry;
     private final ObjectMapper objectMapper;
@@ -59,6 +72,10 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
     private volatile String nodeId;
     private volatile String advertisedAddress;
     private volatile ScheduledExecutorService scheduler;
+    /** 入站事件解析/路由线程池，避免 JSON/Base64 解码占用集群事件循环 */
+    private volatile ExecutorService inboundExecutor;
+    /** 出站负载构造/JSON 编码线程池，避免编码占用 MQTT 与集群事件循环 */
+    private volatile ExecutorService outboundExecutor;
     private volatile boolean running;
 
     public MqttClusterManager(MqttProperties properties,
@@ -84,6 +101,7 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         }
         resolveNodeId();
         resolveAdvertisedAddress();
+        initClusterExecutors();
         clusterServer.bind();
         // 单守护线程周期扫描未覆盖的对等地址并重拨
         scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
@@ -116,7 +134,38 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         peers.clear();
         nodeStates.values().forEach(state -> state.setConnected(false));
         clusterServer.dispose();
+        shutdownExecutor(inboundExecutor);
+        inboundExecutor = null;
+        shutdownExecutor(outboundExecutor);
+        outboundExecutor = null;
         log.info("集群功能已停止");
+    }
+
+    /***
+    * 初始化集群编解码线程池：入站与出站分离，避免大批量编码阻塞入站事件处理。
+    * @author wcdk
+    ***/
+    private void initClusterExecutors() {
+        int configured = properties.getCluster().getCodecThreads();
+        int workers = configured > 0 ? configured : DEFAULT_CODEC_THREADS;
+        inboundExecutor = Executors.newFixedThreadPool(workers, daemonThreadFactory("mqtt-cluster-inbound"));
+        outboundExecutor = Executors.newFixedThreadPool(workers, daemonThreadFactory("mqtt-cluster-outbound"));
+        log.info("集群编解码线程池已启动，每池线程数：{}", workers);
+    }
+
+    private ThreadFactory daemonThreadFactory(String prefix) {
+        AtomicInteger sequence = new AtomicInteger();
+        return runnable -> {
+            Thread thread = new Thread(runnable, prefix + "-" + sequence.incrementAndGet());
+            thread.setDaemon(true);
+            return thread;
+        };
+    }
+
+    private void shutdownExecutor(ExecutorService executor) {
+        if (executor != null) {
+            executor.shutdownNow();
+        }
     }
 
     @Override
@@ -195,7 +244,14 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         Connection[] holder = new Connection[1];
         inbound.withConnection(connection -> holder[0] = connection);
         Connection connection = holder[0];
-        MqttClusterPeer peer = new MqttClusterPeer(connection, this, objectMapper, nodeId, dialed, targetAddress);
+        Executor codecExecutor = outboundExecutor != null ? outboundExecutor : Runnable::run;
+        MqttClusterPeer peer = new MqttClusterPeer(connection, this, objectMapper, nodeId, dialed, targetAddress,
+                codecExecutor, properties.getCluster().getEventQueueCapacity());
+        // 每个连接独立的有序队列：同一节点的入站事件保持顺序，JSON/Base64 解码在工作线程执行
+        SerialTaskQueue inboundQueue = new SerialTaskQueue(
+                inboundExecutor != null ? inboundExecutor : Runnable::run,
+                properties.getCluster().getEventQueueCapacity(),
+                "peer-in-" + System.identityHashCode(peer));
 
         // 心跳靠写空闲触发，超时靠读空闲断链，均无需额外订阅
         long heartbeatInterval = Math.max(1000L, properties.getCluster().getHeartbeatIntervalMillis());
@@ -214,8 +270,20 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
                 .doFinally(signalType -> peer.close());
         Mono<Void> readMono = inbound.receive()
                 .asString(StandardCharsets.UTF_8)
-                .doOnNext(line -> handleLine(peer, line))
+                .doOnNext(line -> {
+                    if (line == null || line.isBlank()) {
+                        return;
+                    }
+                    // 在事件循环上只刷新活跃时间，解析与路由交给有序工作队列
+                    peer.touch();
+                    if (!inboundQueue.submit(() -> handleLine(peer, line))) {
+                        log.warn("集群入站处理队列已满，断开对等连接，远端节点：{}，队列任务数：{}",
+                                peer.remoteNodeId(), properties.getCluster().getEventQueueCapacity());
+                        peer.close();
+                    }
+                })
                 .doFinally(signalType -> {
+                    inboundQueue.close();
                     peer.outboundSink().tryEmitComplete();
                     onPeerClosed(peer);
                 })
@@ -233,7 +301,6 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         if (line == null || line.isBlank()) {
             return;
         }
-        peer.touch();
         ClusterEvent event;
         try {
             event = objectMapper.readValue(line, ClusterEvent.class);
@@ -270,6 +337,7 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
             }
             case PUBLISH -> handleClusterPublish(payload);
             case SESSION_UPSERT -> handleSessionUpsert(payload);
+            case SESSION_BATCH -> handleSessionBatch(payload);
             case SESSION_CLAIM -> handleSessionClaim(payload);
             case SESSION_REMOVE -> handleSessionRemove(payload);
             case KICK -> handleKick(payload);
@@ -324,9 +392,31 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         if (!registerPeer(peer)) {
             return;
         }
-        // 新会话建立后同步本节点全量状态
+        // 新会话建立后同步本节点全量状态；快照构造与 Base64 编码放到工作线程，避免阻塞入站队列
         if (firstRegistration) {
+            submitStateSync(peer);
+        }
+    }
+
+    /***
+    * 异步执行全量状态同步，避免 3 万级会话快照构造占用事件处理线程。
+    * @author wcdk
+    * @param peer 对等连接
+    ***/
+    private void submitStateSync(MqttClusterPeer peer) {
+        ExecutorService executor = outboundExecutor;
+        if (executor == null) {
             sendStateSync(peer);
+            return;
+        }
+        try {
+            executor.execute(() -> {
+                if (!peer.isClosed()) {
+                    sendStateSync(peer);
+                }
+            });
+        } catch (RejectedExecutionException ex) {
+            log.warn("集群状态同步任务提交失败，远端节点：{}，异常信息：{}", peer.remoteNodeId(), ex.getMessage());
         }
     }
 
@@ -341,31 +431,47 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         if (remoteNodeId == null) {
             return false;
         }
-        MqttClusterPeer existing = peers.get(remoteNodeId);
-        if (existing != null && existing != peer && !existing.isClosed()) {
-            boolean keepSelfDialed = nodeId.compareTo(remoteNodeId) < 0;
-            if (peer.isDialed() != keepSelfDialed) {
-                log.info("发现重复的集群连接，丢弃后建立的一条，节点ID：{}，本方主动拨号：{}",
-                        remoteNodeId, peer.isDialed());
-                peer.close();
-                return false;
+        boolean keepSelfDialed = nodeId.compareTo(remoteNodeId) < 0;
+        // 双向互拨时两个线程可能同时登记，用 compute 原子保证每个节点只保留一条连接
+        MqttClusterPeer[] replacedHolder = new MqttClusterPeer[1];
+        boolean[] acceptedHolder = new boolean[1];
+        peers.compute(remoteNodeId, (id, existing) -> {
+            if (existing != null && existing != peer && !existing.isClosed()) {
+                if (peer.isDialed() != keepSelfDialed) {
+                    // 按节点 ID 字典序保留约定方向的连接，丢弃当前连接
+                    acceptedHolder[0] = false;
+                    return existing;
+                }
+                replacedHolder[0] = existing;
             }
-            log.info("发现重复的集群连接，替换既有连接，节点ID：{}", remoteNodeId);
-            existing.close();
-        }
-        boolean replaced = peers.put(remoteNodeId, peer) != peer;
-        ClusterNodeState state = nodeStates.computeIfAbsent(remoteNodeId, id -> {
-            ClusterNodeState created = new ClusterNodeState();
-            created.setNodeId(id);
-            return created;
+            acceptedHolder[0] = true;
+            return peer;
         });
-        state.setAddress(peer.advertisedAddress());
-        state.setConnected(true);
-        state.setDialed(peer.isDialed());
-        state.setLastSeenAt(Instant.now());
-        if (state.getConnectedAt() == null || replaced) {
-            state.setConnectedAt(Instant.now());
+        if (!acceptedHolder[0]) {
+            log.info("发现重复的集群连接，丢弃后建立的一条，节点ID：{}，本方主动拨号：{}",
+                    remoteNodeId, peer.isDialed());
+            peer.close();
+            return false;
         }
+        MqttClusterPeer replacedPeer = replacedHolder[0];
+        if (replacedPeer != null) {
+            log.info("发现重复的集群连接，替换既有连接，节点ID：{}", remoteNodeId);
+            replacedPeer.close();
+        }
+        boolean replaced = replacedPeer != null;
+        // 节点状态同样原子维护，避免并发登记互相覆盖
+        nodeStates.compute(remoteNodeId, (id, existingState) -> {
+            ClusterNodeState current = existingState == null ? new ClusterNodeState() : existingState;
+            current.setNodeId(id);
+            current.setAddress(peer.advertisedAddress());
+            current.setConnected(true);
+            current.setDialed(peer.isDialed());
+            current.setLastSeenAt(Instant.now());
+            if (current.getConnectedAt() == null || replaced) {
+                current.setConnectedAt(Instant.now());
+            }
+            return current;
+        });
         log.info("集群节点已连接，节点ID：{}，地址：{}，本方主动拨号：{}",
                 remoteNodeId, peer.advertisedAddress(), peer.isDialed());
         return true;
@@ -396,18 +502,38 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
     ***/
     private void sendStateSync(MqttClusterPeer peer) {
         List<MqttBrokerMessage> retained = registry.retainedStore().findAll();
-        if (!retained.isEmpty()) {
-            List<Map<String, Object>> items = new ArrayList<>();
-            for (MqttBrokerMessage message : retained) {
+        int retainedBatches = 0;
+        for (int from = 0; from < retained.size(); from += STATE_SYNC_BATCH_SIZE) {
+            int to = Math.min(from + STATE_SYNC_BATCH_SIZE, retained.size());
+            List<Map<String, Object>> items = new ArrayList<>(to - from);
+            for (MqttBrokerMessage message : retained.subList(from, to)) {
                 items.add(messagePayload(message));
             }
-            peer.send(ClusterEventType.RETAINED_SYNC, Map.of("messages", items));
+            if (!peer.send(ClusterEventType.RETAINED_SYNC, Map.of("messages", items))) {
+                log.debug("保留消息同步中止，远端节点：{}", peer.remoteNodeId());
+                return;
+            }
+            retainedBatches++;
         }
+        // 会话快照按批下发，避免 3 万级会话产生同等数量的帧并撑爆对端缓冲
+        List<MqttSession.SessionSnapshot> batch = new ArrayList<>(STATE_SYNC_BATCH_SIZE);
+        int sessionCount = 0;
         for (MqttSession session : registry.sessions()) {
-            peer.send(ClusterEventType.SESSION_UPSERT, Map.of("snapshot", session.snapshot()));
+            batch.add(session.snapshot());
+            sessionCount++;
+            if (batch.size() >= STATE_SYNC_BATCH_SIZE) {
+                if (!peer.send(ClusterEventType.SESSION_BATCH, Map.of("snapshots", batch))) {
+                    log.debug("会话快照同步中止，远端节点：{}", peer.remoteNodeId());
+                    return;
+                }
+                batch = new ArrayList<>(STATE_SYNC_BATCH_SIZE);
+            }
         }
-        log.debug("已向节点 {} 同步状态，保留消息：{}，本地会话：{}",
-                peer.remoteNodeId(), retained.size(), registry.sessionCount());
+        if (!batch.isEmpty()) {
+            peer.send(ClusterEventType.SESSION_BATCH, Map.of("snapshots", batch));
+        }
+        log.debug("已向节点 {} 同步状态，保留消息：{}（{}批），本地会话：{}",
+                peer.remoteNodeId(), retained.size(), retainedBatches, sessionCount);
     }
 
     /***
@@ -484,11 +610,59 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         if (snapshot == null || snapshot.getClientId() == null) {
             return;
         }
+        // C3：合并归属声明后，先释放本地副本再登记远端快照，避免同名会话双在线
+        if (Boolean.TRUE.equals(payload.get("claim"))) {
+            claimLocalSession(snapshot.getClientId());
+        }
         registry.putRemoteSnapshot(snapshot);
         if (snapshot.isOnline()) {
             // 会话已在属主节点上线，本节点的离线缓冲交由属主节点负责
             registry.clearPendingOffline(snapshot.getClientId());
         }
+    }
+
+    /***
+    * 处理批量会话快照同步（新节点加入时的全量状态下发）。
+    * @author wcdk
+    * @param payload 事件负载
+    ***/
+    private void handleSessionBatch(Map<String, Object> payload) {
+        Object value = payload.get("snapshots");
+        if (!(value instanceof List<?> items)) {
+            return;
+        }
+        for (Object item : items) {
+            try {
+                MqttSession.SessionSnapshot snapshot =
+                        objectMapper.convertValue(item, MqttSession.SessionSnapshot.class);
+                if (snapshot == null || snapshot.getClientId() == null) {
+                    continue;
+                }
+                registry.putRemoteSnapshot(snapshot);
+                if (snapshot.isOnline()) {
+                    registry.clearPendingOffline(snapshot.getClientId());
+                }
+            } catch (RuntimeException ex) {
+                log.warn("批量会话快照解析失败，异常信息：{}", ex.getMessage());
+            }
+        }
+    }
+
+    /***
+    * 释放本地同名会话副本，交由其他节点接管。
+    * @author wcdk
+    * @param clientId 客户端 ID
+    ***/
+    private void claimLocalSession(String clientId) {
+        MqttSession local = registry.findByClientId(clientId);
+        if (local == null) {
+            return;
+        }
+        if (local.isActive()) {
+            log.info("客户端已接入其他节点，本节点断开本地连接，客户端ID：{}", clientId);
+            local.closeConnection();
+        }
+        registry.releaseForClaim(clientId);
     }
 
     /***
@@ -503,15 +677,8 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
             return;
         }
         String clientId = clientIdValue.toString();
-        MqttSession local = registry.findByClientId(clientId);
-        if (local != null) {
-            if (local.isActive()) {
-                log.info("客户端已接入其他节点，本节点断开本地连接，客户端ID：{}", clientId);
-                local.closeConnection();
-            }
-            registry.releaseForClaim(clientId);
-            log.debug("已释放本地会话副本，交由属主节点维护，客户端ID：{}", clientId);
-        }
+        claimLocalSession(clientId);
+        log.debug("已释放本地会话副本，交由属主节点维护，客户端ID：{}", clientId);
     }
 
     /***
@@ -566,7 +733,8 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
     }
 
     /***
-    * 广播消息到全部对等节点，接收方仅本地投递。
+    * 按远端订阅索引定向转发消息，仅发送给存在匹配订阅者（含离线持久会话）的节点，
+    * 避免无订阅者时仍向全部对等节点广播造成的带宽放大。
     * @author wcdk
     * @param message 消息
     ***/
@@ -574,8 +742,17 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         if (!running || message == null) {
             return;
         }
-        Map<String, Object> payload = messagePayload(message);
-        for (MqttClusterPeer peer : peers.values()) {
+        Set<String> targetNodes = registry.remoteTargetNodes(message.topic());
+        if (targetNodes.isEmpty()) {
+            return;
+        }
+        // 负载构造（Base64）延迟到编码线程，多个对等节点共享同一份结果
+        Supplier<Map<String, Object>> payload = new LazyPayloadSupplier(() -> messagePayload(message));
+        for (String targetNodeId : targetNodes) {
+            MqttClusterPeer peer = peers.get(targetNodeId);
+            if (peer == null || peer.isClosed()) {
+                continue;
+            }
             peer.send(ClusterEventType.PUBLISH, payload);
         }
     }
@@ -593,8 +770,11 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         }
         MqttSession.SessionSnapshot snapshot = registry.remoteSnapshots().get(clientId);
         String ownerNodeId = snapshot == null ? null : snapshot.getOwnerNodeId();
-        Map<String, Object> payload = new LinkedHashMap<>(messagePayload(message));
-        payload.put("targetClientId", clientId);
+        Supplier<Map<String, Object>> payload = new LazyPayloadSupplier(() -> {
+            Map<String, Object> value = new LinkedHashMap<>(messagePayload(message));
+            value.put("targetClientId", clientId);
+            return value;
+        });
         if (ownerNodeId != null) {
             MqttClusterPeer owner = peers.get(ownerNodeId);
             if (owner != null && !owner.isClosed()) {
@@ -641,19 +821,31 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         return sent;
     }
 
+    /***
+    * 会话状态变更通知：上线时把归属声明（claim）、离线缓冲清理与状态快照合并为单条
+    * SESSION_UPSERT 事件，接收方在登记快照前先释放同名本地副本。
+    * 相比原先 CLAIM + OFFLINE_CLEAR + UPSERT 三条事件，连接风暴下的集群事件量降低约 2/3。
+    * @author wcdk
+    * @param session 发生变更的会话
+    ***/
     @Override
     public void onSessionChanged(MqttSession session) {
         if (!running) {
             return;
         }
-        Map<String, Object> payload = Map.of("snapshot", session.snapshot());
-        for (MqttClusterPeer peer : peers.values()) {
-            if (session.isActive()) {
-                // 先声明归属让对端释放同名本地会话，再同步快照，
-                // 保证对端解除占用后能正确登记远端快照
-                peer.send(ClusterEventType.SESSION_CLAIM, Map.of("clientId", session.clientId()));
-                peer.send(ClusterEventType.OFFLINE_CLEAR, Map.of("clientId", session.clientId()));
+        boolean active = session.isActive();
+        // 会话快照构造在编码线程执行，避免订阅列表/离线队列序列化阻塞 MQTT 事件循环
+        Supplier<Map<String, Object>> payload = new LazyPayloadSupplier(() -> {
+            Map<String, Object> value = new LinkedHashMap<>();
+            value.put("snapshot", session.snapshot());
+            if (active) {
+                // claim=true 让对端先释放同名本地会话再登记远端快照；
+                // 上线快照本身已携带 isOnline，对端据此清理离线缓冲，无需单独的 OFFLINE_CLEAR
+                value.put("claim", Boolean.TRUE);
             }
+            return value;
+        });
+        for (MqttClusterPeer peer : peers.values()) {
             peer.send(ClusterEventType.SESSION_UPSERT, payload);
         }
     }
@@ -801,6 +993,36 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         payload.put("qos", message.qos());
         payload.put("retained", message.retained());
         return payload;
+    }
+
+    /***
+    * 延迟构造并缓存事件负载：多个对等连接共享同一份 Base64 结果，
+    * 实际构造发生在编码线程，不占用调用方的事件循环。
+    * @author wcdk
+    ***/
+    private static final class LazyPayloadSupplier implements Supplier<Map<String, Object>> {
+
+        private final Supplier<Map<String, Object>> delegate;
+        private volatile Map<String, Object> value;
+
+        private LazyPayloadSupplier(Supplier<Map<String, Object>> delegate) {
+            this.delegate = delegate;
+        }
+
+        @Override
+        public Map<String, Object> get() {
+            Map<String, Object> current = value;
+            if (current == null) {
+                synchronized (this) {
+                    current = value;
+                    if (current == null) {
+                        current = delegate.get();
+                        value = current;
+                    }
+                }
+            }
+            return current;
+        }
     }
 
     private MqttBrokerMessage decodeMessage(Map<String, Object> payload) {

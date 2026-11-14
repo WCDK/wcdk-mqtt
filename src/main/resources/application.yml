@@ -49,6 +49,10 @@ wcdk:
       heartbeat-interval-millis: 5000
       node-timeout-millis: 15000
       reconnect-delay-millis: 3000
+      # 集群 JSON/Base64 编解码与事件处理线程数，0 表示按 CPU 自动计算（2–4）
+      codec-threads: 0
+      # 每个对等连接待处理事件队列上限，溢出时断开连接并触发重新同步
+      event-queue-capacity: 4096
     # 网页控制台
     console:
       enabled: true

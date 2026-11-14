@@ -79,12 +79,12 @@ docker compose --profile cluster logs -f mqtt-node1
 | 环境变量                                  | 说明                                                     |
 | ----------------------------------------- | -------------------------------------------------------- |
 | `WCDK_MQTT_CLUSTER_ENABLED`               | 是否启用集群，单实例设为 `false`                         |
-| `WCDK_MQTT_CLUSTER_NODE-ID`               | 节点唯一 ID，同一集群内不能重复                          |
-| `WCDK_MQTT_CLUSTER_ADVERTISE-HOST`        | 本节点对外公布的地址，其他节点据此回连；容器网络填服务名 |
+| `WCDK_MQTT_CLUSTER_NODE_ID`               | 节点唯一 ID，同一集群内不能重复                          |
+| `WCDK_MQTT_CLUSTER_ADVERTISE_HOST`        | 本节点对外公布的地址，其他节点据此回连；容器网络填服务名 |
 | `WCDK_MQTT_CLUSTER_PEERS_0`、`_1`、`_2`…  | 对等地址列表，格式 `host:port`，下标从 0 开始            |
-| `WCDK_MQTT_CLUSTER_BIND-PORT`             | 集群监听端口，默认 28883                                 |
-| `WCDK_MQTT_CLUSTER_HEARTBEAT-INTERVAL-MILLIS` | 心跳间隔，默认 5000ms                                |
-| `WCDK_MQTT_CLUSTER_NODE-TIMEOUT-MILLIS`   | 节点判定超时断开的毫秒数，默认 15000ms                   |
+| `WCDK_MQTT_CLUSTER_BIND_PORT`             | 集群监听端口，默认 28883                                 |
+| `WCDK_MQTT_CLUSTER_HEARTBEAT_INTERVAL_MILLIS` | 心跳间隔，默认 5000ms                                |
+| `WCDK_MQTT_CLUSTER_NODE_TIMEOUT_MILLIS`   | 节点判定超时断开的毫秒数，默认 15000ms                   |
 
 注意事项：
 
@@ -106,8 +106,8 @@ services:
       - "28883:28883"
     environment:
       WCDK_MQTT_CLUSTER_ENABLED: "true"
-      WCDK_MQTT_CLUSTER_NODE-ID: node-a
-      WCDK_MQTT_CLUSTER_ADVERTISE-HOST: 192.168.1.10
+      WCDK_MQTT_CLUSTER_NODE_ID: node-a
+      WCDK_MQTT_CLUSTER_ADVERTISE_HOST: 192.168.1.10
       WCDK_MQTT_CLUSTER_PEERS_0: 192.168.1.11:28883
 
   mqtt-b:
@@ -118,9 +118,9 @@ services:
       - "28884:28883"
     environment:
       WCDK_MQTT_CLUSTER_ENABLED: "true"
-      WCDK_MQTT_CLUSTER_NODE-ID: node-b
-      WCDK_MQTT_CLUSTER_BIND-PORT: 28883
-      WCDK_MQTT_CLUSTER_ADVERTISE-HOST: 192.168.1.11
+      WCDK_MQTT_CLUSTER_NODE_ID: node-b
+      WCDK_MQTT_CLUSTER_BIND_PORT: 28883
+      WCDK_MQTT_CLUSTER_ADVERTISE_HOST: 192.168.1.11
       WCDK_MQTT_CLUSTER_PEERS_0: 192.168.1.10:28883
 ```
 
@@ -128,7 +128,7 @@ services:
 
 ## 六、安全与持久化说明
 
-- 控制台账号：`WCDK_MQTT_SECURITY_CONSOLE-USERNAME` / `WCDK_MQTT_SECURITY_CONSOLE-PASSWORD`，默认 `admin/admin`，生产环境务必修改。
+- 控制台账号：`WCDK_MQTT_SECURITY_CONSOLE_USERNAME` / `WCDK_MQTT_SECURITY_CONSOLE_PASSWORD`，默认 `admin/admin`，生产环境务必修改。
 - MQTT 认证：`WCDK_MQTT_SECURITY_USERNAME` / `WCDK_MQTT_SECURITY_PASSWORD`，并可用 `WCDK_MQTT_SECURITY_ANONYMOUS=false` 禁止匿名接入。
 - 访问控制：通过 `wcdk.mqtt.acl.*` 配置主题级读写规则。
 - **纯内存存储**：重启后会话、保留消息、离线队列全部重置，无数据卷需要挂载；如需保留状态请在应用层做快照。

@@ -256,6 +256,14 @@ public class MqttClientConnection implements MqttConnectionHandle {
         boolean sessionPresent = registry.register(newSession);
         this.connected = true;
 
+        // 归属复核：极端并发下若本会话已被更新连接接管，立即终止当前连接，避免同名双在线
+        if (registry.findByClientId(clientId) != newSession) {
+            log.warn("会话在握手期间已被其他连接接管，终止当前连接，客户端ID：{}，远端地址：{}",
+                    clientId, remoteAddress);
+            close();
+            return;
+        }
+
         sendConnAck(MqttConnectReturnCode.CONNECTION_ACCEPTED, sessionPresent && !cleanSession);
         // 按规范在 CONNACK 之后重放未确认的 QoS 1/2 消息与离线队列
         newSession.replayPendingMessages();

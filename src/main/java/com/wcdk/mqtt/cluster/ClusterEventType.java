@@ -14,8 +14,10 @@ public enum ClusterEventType {
     HEARTBEAT,
     /** 消息发布同步，可携带目标客户端实现点对点转发 */
     PUBLISH,
-    /** 会话状态同步（上线、离线、订阅变更） */
+    /** 会话状态同步（上线、离线、订阅变更），可携带 claim 标记合并归属声明 */
     SESSION_UPSERT,
+    /** 会话状态批量同步，新节点加入时按批下发全量快照 */
+    SESSION_BATCH,
     /** 会话归属声明，通知其他节点同一客户端已接入本节点 */
     SESSION_CLAIM,
     /** 清理会话通知（清理会话销毁时触发） */

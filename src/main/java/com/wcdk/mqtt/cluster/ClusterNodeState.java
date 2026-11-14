@@ -12,20 +12,20 @@ import lombok.Data;
 public class ClusterNodeState {
 
     /** 节点唯一 ID */
-    private String nodeId;
+    private volatile String nodeId;
 
     /** 节点对外公布的地址 host:port */
-    private String address;
+    private volatile String address;
 
     /** 当前是否连接在线 */
-    private boolean connected;
+    private volatile boolean connected;
 
     /** 本节点是主动拨号方返回 true，接受方返回 false */
-    private boolean dialed;
+    private volatile boolean dialed;
 
     /** 最后一次收到该节点报文的时间 */
-    private Instant lastSeenAt;
+    private volatile Instant lastSeenAt;
 
     /** 连接建立时间 */
-    private Instant connectedAt;
+    private volatile Instant connectedAt;
 }
