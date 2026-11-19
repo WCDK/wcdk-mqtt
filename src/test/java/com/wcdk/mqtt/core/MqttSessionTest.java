@@ -3,6 +3,7 @@ package com.wcdk.mqtt.core;
 import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.List;
+import java.util.Map;
 
 import org.junit.jupiter.api.Test;
 
@@ -104,6 +105,101 @@ class MqttSessionTest {
     * 恒为活跃的连接句柄桩，满足会话写出前置条件。
     * @author wcdk
     ***/
+    /***
+    * 验证接管旧会话时完整迁移订阅、离线队列与状态版本，且版本保持单调。
+    * @author wcdk
+    ***/
+    @Test
+    void restoreStateFromShouldCopyStateAndKeepVersionMonotonic() {
+        MqttSession previous = new MqttSession("takeover", false, "user", "node-1");
+        previous.subscribe("takeover/#", 1);
+        previous.enqueueOffline(new MqttBrokerMessage(null, "takeover/a",
+                "1".getBytes(StandardCharsets.UTF_8), 1, false), 10);
+        previous.bumpStateVersion();
+        previous.bumpStateVersion();
+
+        MqttSession next = new MqttSession("takeover", false, "user", "node-2");
+        next.restoreStateFrom(previous);
+
+        assertThat(next.subscriptions()).containsEntry("takeover/#", 1);
+        assertThat(next.offlineQueueSize()).isEqualTo(1);
+        assertThat(next.stateVersion()).isEqualTo(previous.stateVersion());
+        // 接管后继续递增，版本不应回退
+        assertThat(next.bumpStateVersion()).isGreaterThan(previous.stateVersion());
+    }
+
+    /***
+    * 验证接管自身或空会话时不做任何变更。
+    * @author wcdk
+    ***/
+    @Test
+    void restoreStateFromShouldIgnoreNullAndSelf() {
+        MqttSession session = new MqttSession("self-takeover", false, null, "node-1");
+        session.subscribe("self/#", 0);
+
+        session.restoreStateFrom(null);
+        session.restoreStateFrom(session);
+
+        assertThat(session.subscriptions()).containsExactly(Map.entry("self/#", 0));
+    }
+
+    /***
+    * 验证离线队列计数随入队、裁剪、抽取与恢复保持一致。
+    * @author wcdk
+    ***/
+    @Test
+    void offlineQueueDepthShouldTrackCapacityAndDrain() {
+        MqttSession session = new MqttSession("offline-count", false, null, "node-1");
+        for (int i = 0; i < 5; i++) {
+            session.enqueueOffline(new MqttBrokerMessage(null, "offline-count/" + i,
+                    "x".getBytes(StandardCharsets.UTF_8), 1, false), 3);
+        }
+        assertThat(session.offlineQueueSize()).isEqualTo(3);
+
+        List<MqttBrokerMessage> drained = session.drainOfflineSnapshot();
+        assertThat(drained).extracting(MqttBrokerMessage::topic)
+                .containsExactly("offline-count/2", "offline-count/3", "offline-count/4");
+        assertThat(session.offlineQueueSize()).isZero();
+
+        session.restoreOffline(drained);
+        assertThat(session.offlineQueueSize()).isEqualTo(3);
+    }
+
+    /***
+    * 验证入站 QoS1 去重缓存按上限淘汰最旧记录，而不是整体清空。
+    * @author wcdk
+    ***/
+    @Test
+    void inboundQos1CacheShouldEvictOldestInsteadOfClearingAll() {
+        MqttSession session = new MqttSession("qos1-cache", true, null, "node-1");
+        for (int packetId = 1; packetId <= 4097; packetId++) {
+            assertThat(session.isInboundQos1Duplicate(packetId, true)).isFalse();
+        }
+        // 最近记录仍判重，最旧记录已被淘汰并按新报文处理
+        assertThat(session.isInboundQos1Duplicate(4097, true)).isTrue();
+        assertThat(session.isInboundQos1Duplicate(1, true)).isFalse();
+    }
+
+    /***
+    * 验证会话版本以时间种子初始化，节点重启后新会话版本高于重启前的历史版本，
+    * 避免对端把新版本快照判为过期而长期拒绝更新。
+    * @author wcdk
+    ***/
+    @Test
+    void newSessionVersionShouldExceedPreRestartVersion() {
+        MqttSession beforeRestart = new MqttSession("restart-version", false, null, "node-1");
+        beforeRestart.bumpStateVersion();
+        // 模拟重启前推进到约一分钟前的版本号
+        long legacyVersion = System.currentTimeMillis() - 60_000L;
+
+        MqttSession afterRestart = new MqttSession("restart-version", false, null, "node-1");
+
+        assertThat(afterRestart.stateVersion()).isGreaterThan(legacyVersion);
+        // 进程内新会话种子严格递增
+        MqttSession next = new MqttSession("restart-version-2", false, null, "node-1");
+        assertThat(next.stateVersion()).isGreaterThan(afterRestart.stateVersion());
+    }
+
     private static final class StubHandle implements MqttConnectionHandle {
 
         @Override

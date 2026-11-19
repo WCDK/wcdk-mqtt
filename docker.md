@@ -85,12 +85,39 @@ docker compose --profile cluster logs -f mqtt-node1
 | `WCDK_MQTT_CLUSTER_BIND_PORT`             | 集群监听端口，默认 28883                                 |
 | `WCDK_MQTT_CLUSTER_HEARTBEAT_INTERVAL_MILLIS` | 心跳间隔，默认 5000ms                                |
 | `WCDK_MQTT_CLUSTER_NODE_TIMEOUT_MILLIS`   | 节点判定超时断开的毫秒数，默认 15000ms                   |
+| `WCDK_MQTT_CLUSTER_EXPECTED_NODES`        | 固定成员数（含本节点），三节点集群填 `3`；`0` 表示按 peers 数量 + 1 推导 |
+| `WCDK_MQTT_CLUSTER_QUORUM_ENABLED`        | 是否启用多数派校验，默认 `true`                          |
+| `WCDK_MQTT_CLUSTER_USERNAME` / `_PASSWORD` | 集群通道认证凭据，默认强制要求，所有节点必须一致          |
+| `WCDK_MQTT_CLUSTER_REQUIRE_AUTH`          | 是否强制集群认证，默认 `true`；仅在集群端口已完全隔离时可关闭 |
+| `WCDK_MQTT_CLUSTER_TLS_ENABLED`           | 是否启用集群通道 TLS，默认 `false`                       |
+| `WCDK_MQTT_CLUSTER_TLS_CERT_PATH` / `_KEY_PATH` | 集群证书与私钥（PEM），启用 TLS 时必填             |
+| `WCDK_MQTT_CLUSTER_TLS_TRUST_CERT_PATH`   | 互信 CA 证书，配置后启用双向认证                          |
+| `WCDK_MQTT_CLUSTER_TOMBSTONE_TTL_HOURS`   | 删除墓碑保留小时数，默认 168，必须大于节点最长离线时间    |
+
+### 多数派与只读模式
+
+集群按固定成员数计算多数派阈值：`quorum = expected-nodes / 2 + 1`。
+
+- 达成多数派：正常接受连接与写入；
+- 未达成多数派：本节点进入只读模式，拒绝新的 MQTT CONNECT，拒绝 QoS>0 与 retained 写入，QoS0 消息直接丢弃；
+- 分区恢复后，保留消息与会话快照按版本对账，旧数据不会覆盖新数据，删除墓碑会同步传播。
+
+三节点集群中任一节点离线仍有两票，可以继续写入；两个节点同时离线时剩余节点只读。
+二节点集群的多数派阈值为 2，任一节点离线双方都无法写入，因此生产环境建议使用奇数个节点。
+
+注意事项与配置校验：
+
+1. `expected-nodes` 是分区裁决的唯一依据，不能依赖动态发现的节点数，否则孤立节点会误判自己仍是多数派。
+2. 成员数为偶数时启动日志会给出告警，建议改用 1、3、5 等奇数成员。
+3. 可用 `GET /api/cluster` 查看 `expectedNodes`、`quorumSize`、`reachableNodes`、`hasQuorum` 与 `readOnly`。
 
 注意事项：
 
 1. `advertise-host` 不能填 `0.0.0.0`，否则对等节点无法回连；跨宿主机部署时填宿主机 IP。
-2. 节点间时钟不必严格同步，但偏差过大会影响 KeepAlive 判定，建议启用 NTP。
-3. 集群通道当前为明文 TCP，跨不可信网络部署时请置于内网或叠加网络层加密。
+2. 节点间必须启用 NTP：保留消息与会话快照的版本号以时间为基准，偏差过大会影响新旧裁决。
+3. 集群通道默认强制认证，启动前必须配置一致的 `username/password`，否则节点会快速失败退出。
+4. TLS 默认关闭；跨不可信网络部署时请配置证书与私钥，并用 `tls-trust-cert-path` 启用双向认证。
+5. 删除墓碑默认保留 7 天，节点离线时间不能超过该窗口，否则回归后可能复活已删除数据。
 
 ## 五、自定义对等拓扑
 

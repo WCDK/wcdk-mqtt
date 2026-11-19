@@ -41,7 +41,9 @@ import static org.junit.jupiter.api.Assertions.fail;
         "wcdk.mqtt.cluster.bind-port=38901",
         "wcdk.mqtt.cluster.advertise-host=127.0.0.1",
         "wcdk.mqtt.cluster.peers[0]=127.0.0.1:38902",
-        "wcdk.mqtt.cluster.reconnect-delay-millis=1000"
+        "wcdk.mqtt.cluster.reconnect-delay-millis=1000",
+        "wcdk.mqtt.cluster.username=cluster-user",
+        "wcdk.mqtt.cluster.password=cluster-secret"
 })
 class MqttClusterIntegrationTest {
 
@@ -84,7 +86,9 @@ class MqttClusterIntegrationTest {
                         "--wcdk.mqtt.cluster.bind-port=38902",
                         "--wcdk.mqtt.cluster.advertise-host=127.0.0.1",
                         "--wcdk.mqtt.cluster.peers[0]=127.0.0.1:38901",
-                        "--wcdk.mqtt.cluster.reconnect-delay-millis=1000"
+                        "--wcdk.mqtt.cluster.reconnect-delay-millis=1000",
+                        "--wcdk.mqtt.cluster.username=cluster-user",
+                        "--wcdk.mqtt.cluster.password=cluster-secret"
                 });
         clusterManagerB = nodeBContext.getBean(MqttClusterManager.class);
         brokerServerB = nodeBContext.getBean(MqttBrokerServer.class);

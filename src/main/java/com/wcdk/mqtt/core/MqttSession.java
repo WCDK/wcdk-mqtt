@@ -9,6 +9,7 @@ import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 
 import lombok.extern.slf4j.Slf4j;
 
@@ -56,14 +57,32 @@ public class MqttSession {
     private final Map<Integer, PendingOutbound> outboundPending = new ConcurrentHashMap<>();
     /** 入站 QoS 2 待发布消息：包 ID -> 消息 */
     private final Map<Integer, MqttBrokerMessage> inboundQos2 = new ConcurrentHashMap<>();
-    /** 入站 QoS 1 已处理包 ID，用于重复报文判断 */
-    private final Set<Integer> inboundQos1 = ConcurrentHashMap.newKeySet();
+    /** 入站 QoS 1 已处理包 ID 缓存上限，超出后按插入顺序淘汰最旧记录 */
+    private static final int INBOUND_QOS1_CACHE_LIMIT = 4096;
+
+    /**
+     * 进程级会话版本种子：以启动时刻为基准并保证进程内单调，
+     * 节点重启后新会话版本必然大于重启前的旧版本，避免对端把新快照判为过期。
+     */
+    private static final AtomicLong VERSION_SEED = new AtomicLong(System.currentTimeMillis());
+
+    /** 入站 QoS 1 已处理包 ID，用于重复报文判断；有界 LRU 避免整体清空导致重复发布 */
+    private final Map<Integer, Boolean> inboundQos1 = new LinkedHashMap<>(128, 0.75f, false) {
+        @Override
+        protected boolean removeEldestEntry(Map.Entry<Integer, Boolean> eldest) {
+            return size() > INBOUND_QOS1_CACHE_LIMIT;
+        }
+    };
     /** 离线消息队列，仅非清理会话在离线时缓存 */
     private final Queue<MqttBrokerMessage> offlineQueue = new ConcurrentLinkedQueue<>();
+    /** 离线队列元素计数，避免 ConcurrentLinkedQueue.size() 的 O(n) 遍历与并发误差 */
+    private final AtomicInteger offlineQueueDepth = new AtomicInteger();
     /** 离线队列最大容量 */
     private volatile int maxOfflineCapacity = 1000;
     /** 包 ID 发生器 */
     private final AtomicInteger packetIdSequence = new AtomicInteger();
+    /** 会话状态版本，集群对账时用于丢弃迟到的旧快照；以时间种子初始化以兼容节点重启 */
+    private final AtomicLong stateVersion = new AtomicLong(nextVersionSeed());
 
     public MqttSession(String clientId, boolean cleanSession, String username, String ownerNodeId) {
         this.clientId = clientId;
@@ -148,6 +167,34 @@ public class MqttSession {
         return lastActivityTime;
     }
 
+    /***
+    * 分配新会话的版本种子：取当前时间与进程内种子的较大值加一，
+    * 保证同一进程内严格递增，且节点重启后新版本高于重启前的历史版本。
+    * @author wcdk
+    * @return 版本种子
+    ***/
+    private static long nextVersionSeed() {
+        return VERSION_SEED.updateAndGet(current -> Math.max(current + 1, System.currentTimeMillis()));
+    }
+
+    /***
+    * 当前会话状态版本。
+    * @author wcdk
+    * @return 版本号
+    ***/
+    public long stateVersion() {
+        return stateVersion.get();
+    }
+
+    /***
+    * 递增会话状态版本，状态变更同步前调用。
+    * @author wcdk
+    * @return 递增后的版本号
+    ***/
+    public long bumpStateVersion() {
+        return stateVersion.incrementAndGet();
+    }
+
     public void touch() {
         this.lastActivityTime = System.currentTimeMillis();
     }
@@ -203,6 +250,15 @@ public class MqttSession {
 
     public Map<String, Integer> subscriptions() {
         return Map.copyOf(subscriptions);
+    }
+
+    /***
+    * 返回订阅数量，供统计场景使用，避免复制整个订阅表。
+    * @author wcdk
+    * @return 订阅条数
+    ***/
+    public int subscriptionCount() {
+        return subscriptions.size();
     }
 
     public List<String> subscriptionFilters() {
@@ -275,14 +331,11 @@ public class MqttSession {
     * @return 重复返回 true
     ***/
     public synchronized boolean isInboundQos1Duplicate(int packetId, boolean duplicateFlag) {
-        if (duplicateFlag && inboundQos1.contains(packetId)) {
+        if (duplicateFlag && inboundQos1.containsKey(packetId)) {
             return true;
         }
-        inboundQos1.add(packetId);
-        // 防止集合无限增长，超过阈值时整体重置
-        if (inboundQos1.size() > 4096) {
-            inboundQos1.clear();
-        }
+        // 有界 LRU 自动淘汰最旧记录，避免整体清空后把旧包误判为新包
+        inboundQos1.put(packetId, Boolean.TRUE);
         return false;
     }
 
@@ -411,7 +464,7 @@ public class MqttSession {
             return;
         }
         MqttBrokerMessage queued;
-        while ((queued = offlineQueue.poll()) != null) {
+        while ((queued = pollOffline()) != null) {
             int subscriptionQos = maxSubscriptionQos(queued.topic());
             if (subscriptionQos < 0) {
                 continue;
@@ -428,14 +481,17 @@ public class MqttSession {
     ***/
     public void enqueueOffline(MqttBrokerMessage message, int maxCapacity) {
         offlineQueue.add(message);
-        int overflow = offlineQueue.size() - Math.max(1, maxCapacity);
+        int depth = offlineQueueDepth.incrementAndGet();
+        int overflow = depth - Math.max(1, maxCapacity);
         for (int i = 0; i < overflow; i++) {
-            offlineQueue.poll();
+            if (pollOffline() == null) {
+                break;
+            }
         }
     }
 
     public int offlineQueueSize() {
-        return offlineQueue.size();
+        return Math.max(0, offlineQueueDepth.get());
     }
 
     public int maxOfflineCapacity() {
@@ -446,9 +502,10 @@ public class MqttSession {
         this.maxOfflineCapacity = Math.max(1, maxOfflineCapacity);
     }
 
-    public List<MqttBrokerMessage> drainOfflineSnapshot() {
+    public synchronized List<MqttBrokerMessage> drainOfflineSnapshot() {
         List<MqttBrokerMessage> snapshot = new ArrayList<>(offlineQueue);
         offlineQueue.clear();
+        offlineQueueDepth.set(0);
         return snapshot;
     }
 
@@ -458,7 +515,21 @@ public class MqttSession {
         }
         for (MqttBrokerMessage message : messages) {
             offlineQueue.add(message);
+            offlineQueueDepth.incrementAndGet();
         }
+    }
+
+    /***
+    * 从离线队列取出队首消息并同步队列计数。
+    * @author wcdk
+    * @return 队首消息，队列为空返回 null
+    ***/
+    private MqttBrokerMessage pollOffline() {
+        MqttBrokerMessage message = offlineQueue.poll();
+        if (message != null) {
+            offlineQueueDepth.decrementAndGet();
+        }
+        return message;
     }
 
     public int outboundPendingCount() {
@@ -479,21 +550,68 @@ public class MqttSession {
 
     /***
     * 从既有会话迁移状态，用于同 clientId 重连时恢复订阅与 QoS 状态。
+    * 旧连接接管后仍可能在其事件循环中处理 PUBACK/PUBREC，因此先在旧会话锁内
+    * 复制一份不可变状态，再写入当前会话，避免读取到更新中的中间状态。
+    * 复制与写入分两步执行，不嵌套持锁，避免引入锁顺序问题。
     * @author wcdk
     * @param previous 旧会话
     ***/
-    public synchronized void restoreStateFrom(MqttSession previous) {
+    public void restoreStateFrom(MqttSession previous) {
+        if (previous == null || previous == this) {
+            return;
+        }
+        applyTransferState(previous.copyTransferState());
+    }
+
+    /***
+    * 在旧会话锁内复制可迁移状态，返回的容器均为独立副本。
+    * @author wcdk
+    * @return 状态副本
+    ***/
+    private synchronized TransferState copyTransferState() {
+        return new TransferState(
+                new LinkedHashMap<>(subscriptions),
+                new ArrayList<>(publishedTopics),
+                new LinkedHashMap<>(outboundPending),
+                new LinkedHashMap<>(inboundQos2),
+                new ArrayList<>(offlineQueue),
+                packetIdSequence.get(),
+                stateVersion.get());
+    }
+
+    /***
+    * 将状态副本写入当前会话，并沿用旧会话版本号保证版本继续单调。
+    * @author wcdk
+    * @param state 状态副本
+    ***/
+    private synchronized void applyTransferState(TransferState state) {
         subscriptions.clear();
-        subscriptions.putAll(previous.subscriptions);
+        subscriptions.putAll(state.subscriptions());
         publishedTopics.clear();
-        publishedTopics.addAll(previous.publishedTopics);
+        publishedTopics.addAll(state.publishedTopics());
         outboundPending.clear();
-        outboundPending.putAll(previous.outboundPending);
+        outboundPending.putAll(state.outboundPending());
         inboundQos2.clear();
-        inboundQos2.putAll(previous.inboundQos2);
+        inboundQos2.putAll(state.inboundQos2());
         offlineQueue.clear();
-        offlineQueue.addAll(previous.offlineQueue);
-        packetIdSequence.set(previous.packetIdSequence.get());
+        offlineQueue.addAll(state.offlineQueue());
+        offlineQueueDepth.set(state.offlineQueue().size());
+        packetIdSequence.set(state.packetIdSequence());
+        stateVersion.updateAndGet(current -> Math.max(current, state.stateVersion()));
+    }
+
+    /***
+    * 会话状态迁移副本，隔离复制与写入两个阶段。
+    * @author wcdk
+    ***/
+    private record TransferState(
+            Map<String, Integer> subscriptions,
+            List<String> publishedTopics,
+            Map<Integer, PendingOutbound> outboundPending,
+            Map<Integer, MqttBrokerMessage> inboundQos2,
+            List<MqttBrokerMessage> offlineQueue,
+            int packetIdSequence,
+            long stateVersion) {
     }
 
     /***
@@ -543,6 +661,7 @@ public class MqttSession {
         snapshot.setSessionExpirySeconds(sessionExpirySeconds);
         snapshot.setUsername(username);
         snapshot.setOwnerNodeId(ownerNodeId);
+        snapshot.setStateVersion(stateVersion.get());
         snapshot.setOnline(isActive());
         snapshot.setSubscriptions(new LinkedHashMap<>(subscriptions));
         snapshot.setPublishedTopics(new ArrayList<>(publishedTopics));
@@ -613,6 +732,8 @@ public class MqttSession {
             }
         }
         packetIdSequence.set(Math.max(0, snapshot.getPacketIdSequence()));
+        // 接管远端状态后沿用其版本，保证后续本地变更版本继续单调
+        stateVersion.updateAndGet(current -> Math.max(current, snapshot.getStateVersion()));
     }
 
     private static MqttBrokerMessage decodeMessage(SnapshotMessage item) {
@@ -703,6 +824,8 @@ public class MqttSession {
         private long sessionExpirySeconds = Long.MAX_VALUE;
         private String username;
         private String ownerNodeId;
+        /** 会话状态版本，0 表示旧节点快照（无版本） */
+        private long stateVersion;
         private boolean online;
         private Map<String, Integer> subscriptions = new LinkedHashMap<>();
         private List<String> publishedTopics = new ArrayList<>();
@@ -717,6 +840,15 @@ public class MqttSession {
         ***/
         public boolean persistsAfterDisconnect() {
             return protocolLevel < 5 ? !cleanSession : sessionExpirySeconds > 0;
+        }
+
+        /***
+        * 返回快照中的订阅数量，供统计场景使用，避免复制订阅表。
+        * @author wcdk
+        * @return 订阅条数
+        ***/
+        public int subscriptionCount() {
+            return subscriptions == null ? 0 : subscriptions.size();
         }
     }
 

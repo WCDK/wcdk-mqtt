@@ -344,7 +344,12 @@
           card('本节点 ID', data.nodeId || '—', true) +
           card('公布地址', data.advertiseAddress || '—', true) +
           card('监听端口', data.bindHost + ':' + data.bindPort, true) +
-          card('已连接对等节点', data.connectedPeers);
+          card('已连接对等节点', data.connectedPeers) +
+          card('多数派状态', data.enabled
+              ? (data.hasQuorum ? '已达成' : '未达成 · 只读')
+              : '单实例无需多数派', true) +
+          card('可达 / 固定成员', data.reachableNodes + ' / ' + data.expectedNodes, true) +
+          card('多数派阈值', data.quorumSize, true);
       var rows = (data.nodes || []).map(function (node) {
         return '<tr>' +
             '<td>' + escapeHtml(node.nodeId) + '</td>' +

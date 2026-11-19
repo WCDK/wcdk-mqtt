@@ -43,13 +43,23 @@ public class MqttBrokerService {
 
     /***
     * 发布消息到本节点并同步广播到集群对等节点。
+    * 未达成多数派时拒绝写入，作为协议层闸门的最后一道防线。
     * @author wcdk
     * @param message 消息
+    * @return 已接受写入返回 true
     ***/
-    public void publish(MqttBrokerMessage message) {
+    public boolean publish(MqttBrokerMessage message) {
         if (message == null || !MqttTopicMatcher.isValidTopicName(message.topic())) {
             log.warn("拒绝发布非法主题消息，主题：{}", message == null ? null : message.topic());
-            return;
+            return false;
+        }
+        if (!hasQuorum()) {
+            MqttClusterManager clusterManager = clusterManagerProvider.getIfAvailable();
+            log.warn("集群未达成多数派，拒绝写入消息，主题：{}，QoS：{}，保留：{}，可达节点：{}，多数派阈值：{}",
+                    message.topic(), message.qos(), message.retained(),
+                    clusterManager == null ? 1 : clusterManager.reachableNodeCount(),
+                    clusterManager == null ? 1 : clusterManager.quorumSize());
+            return false;
         }
         // 本地投递（含保留消息与离线缓冲）
         registry.deliver(message);
@@ -58,6 +68,20 @@ public class MqttBrokerService {
         if (clusterManager != null && clusterManager.isRunning()) {
             clusterManager.broadcastPublish(message);
         }
+        return true;
+    }
+
+    /***
+    * 当前节点是否具备写能力（达成多数派或未启用集群）。
+    * @author wcdk
+    * @return 可写返回 true
+    ***/
+    public boolean hasQuorum() {
+        MqttClusterManager clusterManager = clusterManagerProvider.getIfAvailable();
+        if (clusterManager == null || !clusterManager.isRunning()) {
+            return true;
+        }
+        return clusterManager.hasQuorum();
     }
 
     /***
@@ -93,35 +117,8 @@ public class MqttBrokerService {
     * @return 概览视图
     ***/
     public Overview overview() {
-        int activeSessions = 0;
-        int offlineSessions = 0;
-        int totalSubscriptions = 0;
-        for (MqttSession session : registry.sessions()) {
-            if (session.isActive()) {
-                activeSessions++;
-            } else {
-                offlineSessions++;
-            }
-            totalSubscriptions += session.subscriptions().size();
-        }
-        // 远端会话快照（集群同步来的），计入未被本节点占据的会话
-        for (MqttSession.SessionSnapshot snapshot : registry.remoteSnapshots().values()) {
-            if (snapshot == null || snapshot.getClientId() == null) {
-                continue;
-            }
-            // 若本节点已有该 clientId 的活跃会话，远端快照不重复计入
-            if (registry.findByClientId(snapshot.getClientId()) != null) {
-                continue;
-            }
-            if (snapshot.isOnline()) {
-                activeSessions++;
-            } else {
-                offlineSessions++;
-            }
-            if (snapshot.getSubscriptions() != null) {
-                totalSubscriptions += snapshot.getSubscriptions().size();
-            }
-        }
+        // 概览统计按配置窗口缓存，避免高频轮询时反复遍历全部会话与订阅
+        MqttSessionRegistry.Statistics statistics = registry.statistics();
         Overview overview = new Overview();
         overview.setStartedAt(startedAt);
         overview.setUptimeSeconds(java.time.Duration.between(startedAt, Instant.now()).toSeconds());
@@ -129,10 +126,10 @@ public class MqttBrokerService {
         overview.setMqttHost(properties.getBroker().getHost());
         overview.setMqttPort(properties.getBroker().getPort());
         overview.setTotalSessions(registry.sessionCount());
-        overview.setActiveSessions(activeSessions);
-        overview.setOfflineSessions(offlineSessions);
+        overview.setActiveSessions(statistics.activeSessions());
+        overview.setOfflineSessions(statistics.offlineSessions());
         overview.setRemoteSessions(registry.remoteSnapshotCount());
-        overview.setTotalSubscriptions(totalSubscriptions);
+        overview.setTotalSubscriptions(statistics.totalSubscriptions());
         overview.setRetainedMessages(registry.retainedStore().size());
         overview.setBufferedOfflineClients(registry.pendingOfflineCount());
         overview.setMessageLogSize(messageLog.size());

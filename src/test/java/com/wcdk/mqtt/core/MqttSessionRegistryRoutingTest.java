@@ -18,9 +18,11 @@ class MqttSessionRegistryRoutingTest {
 
     private MqttSessionRegistry registry;
 
+    private MqttProperties properties;
+
     @BeforeEach
     void setUp() {
-        MqttProperties properties = new MqttProperties();
+        properties = new MqttProperties();
         // 单测不依赖保留消息与远端离线缓冲，缩小投递路径干扰面
         properties.getBroker().setRetainedMessages(false);
         properties.getBroker().setOfflineQueue(false);
@@ -160,6 +162,108 @@ class MqttSessionRegistryRoutingTest {
         // 预判为 false 时完整匹配必不命中
         assertThat(MqttTopicMatcher.matches("it/+", "sensor/1")).isFalse();
         assertThat(MqttTopicMatcher.matches("#", "$SYS/uptime")).isFalse();
+    }
+
+    /***
+    * 验证概览统计聚合本地在线/离线会话与远端快照，且订阅计数不复制订阅表。
+    * @author wcdk
+    ***/
+    @Test
+    void statisticsShouldAggregateLocalAndRemoteSessions() {
+        register("stats-online", "stats/a");
+        MqttSession persistent = new MqttSession("stats-offline", false, null, "node-1");
+        persistent.attach(new RecordingHandle());
+        registry.register(persistent);
+        persistent.subscribe("stats/offline", 1);
+        registry.notifySessionChanged(persistent);
+        registry.remove(persistent);
+
+        MqttSession.SessionSnapshot remote = new MqttSession.SessionSnapshot();
+        remote.setClientId("remote-1");
+        remote.setOwnerNodeId("node-2");
+        remote.setOnline(true);
+        remote.setSubscriptions(java.util.Map.of("remote/#", 1));
+        registry.putRemoteSnapshot(remote);
+
+        MqttSessionRegistry.Statistics statistics = registry.statistics();
+
+        assertThat(statistics.activeSessions()).isEqualTo(2);
+        assertThat(statistics.offlineSessions()).isEqualTo(1);
+        assertThat(statistics.totalSubscriptions()).isEqualTo(3);
+    }
+
+    /***
+    * 验证概览统计在缓存窗口内复用结果，窗口关闭后重新计算。
+    * @author wcdk
+    ***/
+    @Test
+    void statisticsShouldReuseCacheWithinConfiguredWindow() {
+        properties.getConsole().setOverviewCacheMillis(60_000);
+        register("cache-a", "cache/a");
+        assertThat(registry.statistics().totalSubscriptions()).isEqualTo(1);
+
+        MqttSession session = registry.findByClientId("cache-a");
+        session.subscribe("cache/b", 1);
+        registry.notifySessionChanged(session);
+
+        // 窗口内仍返回缓存结果
+        assertThat(registry.statistics().totalSubscriptions()).isEqualTo(1);
+
+        properties.getConsole().setOverviewCacheMillis(0);
+        assertThat(registry.statistics().totalSubscriptions()).isEqualTo(2);
+    }
+
+    /***
+    * 验证远端订阅索引按主题定向返回属主节点，未命中订阅的节点不会被转发，
+    * 且 $ 系统主题不受首层通配过滤器影响。
+    * @author wcdk
+    ***/
+    @Test
+    void remoteTargetNodesShouldOnlyReturnMatchingOwners() {
+        registry.putRemoteSnapshot(remoteSnapshot("remote-temp", "node-2", "it/+/temp"));
+        registry.putRemoteSnapshot(remoteSnapshot("remote-other", "node-3", "other/#"));
+        registry.putRemoteSnapshot(remoteSnapshot("remote-all", "node-4", "#"));
+
+        assertThat(registry.remoteTargetNodes("it/a/temp"))
+                .containsExactlyInAnyOrder("node-2", "node-4");
+        assertThat(registry.remoteTargetNodes("other/x"))
+                .containsExactlyInAnyOrder("node-3", "node-4");
+        // 无任何远端订阅命中时不产生跨节点转发
+        assertThat(registry.remoteTargetNodes("unmatched/topic")).containsExactly("node-4");
+        // $ 系统主题不能被 # 命中
+        assertThat(registry.remoteTargetNodes("$SYS/broker/uptime")).isEmpty();
+
+        registry.removeRemoteSnapshot("remote-all");
+        assertThat(registry.remoteTargetNodes("it/a/temp")).containsExactly("node-2");
+        assertThat(registry.remoteTargetNodes("other/x")).containsExactly("node-3");
+        assertThat(registry.remoteTargetNodes("$SYS/broker/uptime")).isEmpty();
+    }
+
+    /***
+    * 验证同一节点多个客户端共享同一过滤器时，移除其中一个不会误删该节点的转发目标。
+    * @author wcdk
+    ***/
+    @Test
+    void removingOneOfMultipleRemoteSubscribersShouldKeepNodeTarget() {
+        registry.putRemoteSnapshot(remoteSnapshot("remote-a", "node-2", "shared/topic"));
+        registry.putRemoteSnapshot(remoteSnapshot("remote-b", "node-2", "shared/topic"));
+
+        assertThat(registry.remoteTargetNodes("shared/topic")).containsExactly("node-2");
+
+        registry.removeRemoteSnapshot("remote-a");
+        assertThat(registry.remoteTargetNodes("shared/topic")).containsExactly("node-2");
+
+        registry.removeRemoteSnapshot("remote-b");
+        assertThat(registry.remoteTargetNodes("shared/topic")).isEmpty();
+    }
+
+    private MqttSession.SessionSnapshot remoteSnapshot(String clientId, String nodeId, String topicFilter) {
+        MqttSession.SessionSnapshot snapshot = new MqttSession.SessionSnapshot();
+        snapshot.setClientId(clientId);
+        snapshot.setOwnerNodeId(nodeId);
+        snapshot.setOnline(true);
+        snapshot.setSubscriptions(java.util.Map.of(topicFilter, 1));
+        return snapshot;
     }
 
     private RecordingHandle register(String clientId, String topicFilter) {

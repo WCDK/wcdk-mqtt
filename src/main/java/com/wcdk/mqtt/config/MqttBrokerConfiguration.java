@@ -28,13 +28,15 @@ public class MqttBrokerConfiguration {
     }
 
     /***
-    * 保留消息存储 Bean。
+    * 保留消息存储 Bean，墓碑保留时长与集群配置一致。
     * @author wcdk
+    * @param properties 配置
     * @return 保留消息存储
     ***/
     @Bean
-    public MqttRetainedStore mqttRetainedStore() {
-        return new MqttRetainedStore();
+    public MqttRetainedStore mqttRetainedStore(MqttProperties properties) {
+        long ttlMillis = Math.max(1L, properties.getCluster().getTombstoneTtlHours()) * 60 * 60 * 1000L;
+        return new MqttRetainedStore(ttlMillis);
     }
 
     /***

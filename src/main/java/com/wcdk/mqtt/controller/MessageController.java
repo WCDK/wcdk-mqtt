@@ -105,8 +105,8 @@ public class MessageController {
     public Mono<ApiResponse<List<RetainedView>>> retained() {
         return Mono.fromSupplier(() -> {
             List<RetainedView> result = new ArrayList<>();
-            for (MqttBrokerMessage message : retainedStore.findAll()) {
-                result.add(toView(message));
+            for (MqttRetainedStore.RetainedEntry entry : retainedStore.findAll()) {
+                result.add(toView(entry.message()));
             }
             result.sort((left, right) -> left.topic().compareTo(right.topic()));
             return ApiResponse.ok(result);

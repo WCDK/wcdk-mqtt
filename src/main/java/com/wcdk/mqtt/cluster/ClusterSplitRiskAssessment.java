@@ -120,24 +120,15 @@ public class ClusterSplitRiskAssessment {
             score += SINGLE_NODE_WEIGHT;
         }
 
-        // 5. 检查配置的对等节点是否实际存在
-        List<String> configuredPeers = properties.getCluster().getPeers();
-        if (configuredPeers != null && !configuredPeers.isEmpty()) {
-            int activePeerCount = 0;
-            for (String peerAddr : configuredPeers) {
-                if (peerAddr != null && !peerAddr.isBlank()) {
-                    // 通过 connectedPeerCount 和 nodes 间接检查连通性
-                    // 只要有至少一个对等节点连接，即视为部分活跃
-                    if (clusterManager.connectedPeerCount() > 0) {
-                        activePeerCount++;
-                        break;
-                    }
-                }
-            }
-            // 配置了对等节点但实际活动连接少，风险增加
-            if (!configuredPeers.isEmpty() && activePeerCount < configuredPeers.size()) {
-                score += 15;
-            }
+        // 5. 多数派状态：未达成多数派时已进入只读，说明集群处于分区或节点不足状态
+        if (!clusterManager.hasQuorum()) {
+            score += 40;
+        }
+
+        // 6. 检查固定成员是否全部可达（按固定成员数而非动态发现计算）
+        int missingNodes = Math.max(0, clusterManager.expectedNodeCount() - clusterManager.reachableNodeCount());
+        if (missingNodes > 0 && totalConfiguredPeers > 0) {
+            score += 15;
         }
 
         // 确保分数在 0-100 范围内
@@ -196,6 +187,12 @@ public class ClusterSplitRiskAssessment {
             factors.add("建议保持现有的心跳和超时配置");
         }
 
+        // 多数派状态直接决定写能力，风险描述优先展示
+        if (clusterManager != null && clusterManager.isRunning() && !clusterManager.hasQuorum()) {
+            factors.add(0, "当前节点未达成多数派，已进入只读模式并拒绝新连接与持久写入");
+        } else if (clusterManager != null && clusterManager.isRunning()) {
+            factors.add("当前节点已达成多数派，具备正常写能力");
+        }
         return factors;
     }
 

@@ -15,14 +15,18 @@ wcdk:
       enabled: true
       host: 0.0.0.0
       port: 1883
-      max-payload-size: 1048576
+      # 单条消息负载上限，按遥测实际大小收紧，降低大消息攻击面
+      max-payload-size: 65536
       max-client-id-length: 128
       retained-messages: true
       offline-queue: true
-      max-offline-messages: 1000
+      # 单个离线会话缓存上限，避免大量离线会话时内存成倍放大
+      max-offline-messages: 100
       retransmit-timeout-millis: 10000
       max-retransmit-attempts: 3
       sweep-interval-seconds: 5
+      # 单连接出站缓冲上限，超出判定慢消费者并断开，防止慢消费者放大内存
+      max-outbound-buffer: 256
       message-log-capacity: 500
     # 认证与控制台安全配置
     security:
@@ -46,9 +50,24 @@ wcdk:
       peers: []
       username:
       password:
+      # 集群认证：启用集群时必须配置 username/password，否则启动失败；
+      # 仅在集群端口已由网络策略完全隔离时才可显式关闭
+      require-auth: true
+      # 集群通道 TLS：启用后需提供证书与私钥，配置互信 CA 时启用双向认证
+      tls-enabled: false
+      tls-cert-path:
+      tls-key-path:
+      tls-trust-cert-path:
+      # 保留消息/会话删除墓碑保留小时数，必须大于节点最长允许离线时间（默认 7 天）
+      tombstone-ttl-hours: 168
       heartbeat-interval-millis: 5000
       node-timeout-millis: 15000
       reconnect-delay-millis: 3000
+      # 是否启用多数派校验：未达成多数派时本节点只读，拒绝新连接与持久写入
+      quorum-enabled: true
+      # 集群固定成员数（含本节点），0 表示按 peers 非空数量 + 1 计算。
+      # 三节点集群务必显式配置为 3，避免动态发现导致多数派判断失真
+      expected-nodes: 0
       # 集群 JSON/Base64 编解码与事件处理线程数，0 表示按 CPU 自动计算（2–4）
       codec-threads: 0
       # 每个对等连接待处理事件队列上限，溢出时断开连接并触发重新同步
@@ -56,6 +75,8 @@ wcdk:
     # 网页控制台
     console:
       enabled: true
+      # 概览统计缓存毫秒数，避免控制台高频轮询反复遍历全部会话与订阅；0 表示实时计算
+      overview-cache-millis: 1000
 
 logging:
   level:

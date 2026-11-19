@@ -32,6 +32,8 @@ public class MqttSessionRegistry {
     private final Map<String, MqttSession> localSessions = new ConcurrentHashMap<>();
     /** 其他节点同步来的会话快照，用于跨节点路由与离线缓冲 */
     private final Map<String, MqttSession.SessionSnapshot> remoteSnapshots = new ConcurrentHashMap<>();
+    /** 已删除远端快照的版本墓碑，避免陈旧的全量同步把会话重新写回 */
+    private final Map<String, RemovedSnapshot> removedSnapshots = new ConcurrentHashMap<>();
     /** 已知但尚未接入本节点的持久会话离线缓冲 */
     private final Map<String, Queue<MqttBrokerMessage>> pendingOffline = new ConcurrentHashMap<>();
 
@@ -61,8 +63,24 @@ public class MqttSessionRegistry {
     /** 客户端ID → 远端订阅索引条目，用于快照变更时做增量差集 */
     private final Map<String, RemoteSubscription> remoteClientSubscriptions = new ConcurrentHashMap<>();
 
+    /** 概览统计缓存锁与结果，避免控制台高频轮询反复遍历全部会话与订阅。 */
+    private final Object statisticsLock = new Object();
+    private volatile Statistics statisticsCache;
+    private volatile long statisticsCacheAtMillis;
+
     /** 远端会话订阅索引条目：属主节点与订阅过滤器集合。 */
     private record RemoteSubscription(String nodeId, Set<String> filters) {
+    }
+
+    /** 远端会话删除墓碑：版本号与记录时间，超过保留期后清理。 */
+    private record RemovedSnapshot(long version, long removedAt) {
+    }
+
+    /** 会话删除墓碑保留时长，默认 7 天，可由集群配置覆盖 */
+    private final long removedSnapshotTtlMillis;
+
+    /** 概览统计结果：在线/离线会话数与订阅总数（含远端快照）。 */
+    public record Statistics(int activeSessions, int offlineSessions, int totalSubscriptions) {
     }
 
     public MqttSessionRegistry(MqttProperties properties,
@@ -71,6 +89,8 @@ public class MqttSessionRegistry {
         this.properties = properties;
         this.acl = acl;
         this.retainedStore = retainedStore;
+        long ttlHours = properties.getCluster().getTombstoneTtlHours();
+        this.removedSnapshotTtlMillis = Math.max(1L, ttlHours) * 60 * 60 * 1000L;
         for (int i = 0; i < registrationLocks.length; i++) {
             registrationLocks[i] = new Object();
         }
@@ -149,6 +169,7 @@ public class MqttSessionRegistry {
             localSessions.put(session.clientId(), session);
             // 本地已接管该客户端，清理远端快照并同步移除远端订阅索引
             remoteSnapshots.remove(session.clientId());
+            removedSnapshots.remove(session.clientId());
             removeRemoteSnapshotIndex(session.clientId());
             session.setMaxOfflineCapacity(properties.getBroker().getMaxOfflineMessages());
             // 消息已知但会话尚未接入时缓冲的离线消息在这里一次性冲刷
@@ -486,11 +507,27 @@ public class MqttSessionRegistry {
     * @return 本次投递命中的订阅过滤器（去重）
     ***/
     public List<String> deliver(MqttBrokerMessage message) {
+        return deliver(message, null);
+    }
+
+    /***
+    * 将消息路由到本节点所有命中的订阅者，并为离线持久会话缓冲。
+    * 保留消息若携带集群版本，则按版本合并而不是覆盖本地当前值。
+    * @author wcdk
+    * @param message 消息
+    * @param retainedVersion 保留消息版本，null 表示本地写入
+    * @return 本次投递命中的订阅过滤器（去重）
+    ***/
+    public List<String> deliver(MqttBrokerMessage message, Long retainedVersion) {
         if (message == null || !MqttTopicMatcher.isValidTopicName(message.topic())) {
             return List.of();
         }
         if (properties.getBroker().isRetainedMessages()) {
-            retainedStore.store(message);
+            if (retainedVersion == null) {
+                retainedStore.store(message);
+            } else {
+                retainedStore.store(message, retainedVersion);
+            }
         }
         // 1. 索引定位命中的过滤器，再反查候选订阅者，避免遍历全部会话
         Set<String> matchedFilters = matchedCandidateFilters(message.topic());
@@ -678,6 +715,66 @@ public class MqttSessionRegistry {
         return count;
     }
 
+    /***
+    * 返回按配置窗口缓存的概览统计，控制台高频轮询时最多每窗口遍历一次全部会话。
+    * 统计包含远端会话快照，且使用 {@code subscriptionCount()} 避免复制订阅表。
+    * @author wcdk
+    * @return 概览统计
+    ***/
+    public Statistics statistics() {
+        long cacheMillis = properties.getConsole().getOverviewCacheMillis();
+        if (cacheMillis > 0) {
+            Statistics cached = statisticsCache;
+            if (cached != null && System.currentTimeMillis() - statisticsCacheAtMillis < cacheMillis) {
+                return cached;
+            }
+        }
+        synchronized (statisticsLock) {
+            if (cacheMillis > 0) {
+                Statistics cached = statisticsCache;
+                if (cached != null && System.currentTimeMillis() - statisticsCacheAtMillis < cacheMillis) {
+                    return cached;
+                }
+            }
+            Statistics computed = computeStatistics();
+            statisticsCache = computed;
+            statisticsCacheAtMillis = System.currentTimeMillis();
+            return computed;
+        }
+    }
+
+    private Statistics computeStatistics() {
+        int activeSessions = 0;
+        int offlineSessions = 0;
+        int totalSubscriptions = 0;
+        for (MqttSession session : localSessions.values()) {
+            if (session.isActive()) {
+                activeSessions++;
+            } else {
+                offlineSessions++;
+            }
+            totalSubscriptions += session.subscriptionCount();
+        }
+        // 远端会话快照（集群同步来的），计入未被本节点占据的会话
+        for (Map.Entry<String, MqttSession.SessionSnapshot> entry : remoteSnapshots.entrySet()) {
+            MqttSession.SessionSnapshot snapshot = entry.getValue();
+            if (snapshot == null || snapshot.getClientId() == null) {
+                continue;
+            }
+            // 若本节点已有该 clientId 的本地会话，远端快照不重复计入
+            if (localSessions.containsKey(entry.getKey())) {
+                continue;
+            }
+            if (snapshot.isOnline()) {
+                activeSessions++;
+            } else {
+                offlineSessions++;
+            }
+            totalSubscriptions += snapshot.subscriptionCount();
+        }
+        return new Statistics(activeSessions, offlineSessions, totalSubscriptions);
+    }
+
     public int sessionCount() {
         return localSessions.size();
     }
@@ -694,9 +791,51 @@ public class MqttSessionRegistry {
         if (localSessions.containsKey(snapshot.getClientId())) {
             return;
         }
+        // 删除墓碑优先：版本不高于墓碑的迟到快照直接丢弃
+        RemovedSnapshot removed = removedSnapshots.get(snapshot.getClientId());
+        if (removed != null) {
+            if (snapshot.getStateVersion() > 0 && snapshot.getStateVersion() <= removed.version()) {
+                log.debug("忽略版本过旧的远端会话快照，客户端ID：{}，快照版本：{}，删除版本：{}",
+                        snapshot.getClientId(), snapshot.getStateVersion(), removed.version());
+                return;
+            }
+            removedSnapshots.remove(snapshot.getClientId());
+        }
+        MqttSession.SessionSnapshot existing = remoteSnapshots.get(snapshot.getClientId());
+        if (existing != null && !isSnapshotNewer(snapshot, existing)) {
+            log.debug("忽略版本过旧的远端会话快照，客户端ID：{}，快照版本：{}，当前版本：{}",
+                    snapshot.getClientId(), snapshot.getStateVersion(), existing.getStateVersion());
+            return;
+        }
         remoteSnapshots.put(snapshot.getClientId(), snapshot);
         // 同步维护远端订阅索引，供发布时按主题定向转发
         indexRemoteSnapshot(snapshot);
+    }
+
+    /***
+    * 判断候选快照是否比现有快照更新：先比版本，版本相同再比属主节点 ID 字典序。
+    * 无版本的旧节点快照仅在现有快照同样无版本时按到达顺序接受。
+    * @author wcdk
+    * @param candidate 候选快照
+    * @param existing 现有快照
+    * @return 候选更新返回 true
+    ***/
+    private static boolean isSnapshotNewer(MqttSession.SessionSnapshot candidate,
+                                           MqttSession.SessionSnapshot existing) {
+        long candidateVersion = candidate.getStateVersion();
+        long existingVersion = existing.getStateVersion();
+        if (candidateVersion <= 0) {
+            return existingVersion <= 0;
+        }
+        int byVersion = Long.compare(candidateVersion, existingVersion);
+        if (byVersion != 0) {
+            return byVersion > 0;
+        }
+        return nullSafe(candidate.getOwnerNodeId()).compareTo(nullSafe(existing.getOwnerNodeId())) >= 0;
+    }
+
+    private static String nullSafe(String value) {
+        return value == null ? "" : value;
     }
 
     /***
@@ -711,6 +850,48 @@ public class MqttSessionRegistry {
         remoteSnapshots.remove(clientId);
         pendingOffline.remove(clientId);
         removeRemoteSnapshotIndex(clientId);
+    }
+
+    /***
+    * 按删除事件携带的版本移除远端会话快照，丢弃迟到的旧删除指令。
+    * @author wcdk
+    * @param clientId 客户端 ID
+    * @param version 删除事件版本，非正数表示旧节点无版本
+    * @param ownerNodeId 删除发起节点 ID
+    ***/
+    public void removeRemoteSnapshot(String clientId, long version, String ownerNodeId) {
+        if (clientId == null) {
+            return;
+        }
+        MqttSession.SessionSnapshot existing = remoteSnapshots.get(clientId);
+        if (existing != null && version > 0) {
+            if (existing.getStateVersion() > version) {
+                log.debug("忽略版本过旧的会话删除指令，客户端ID：{}，删除版本：{}，快照版本：{}",
+                        clientId, version, existing.getStateVersion());
+                return;
+            }
+            // 版本相同时与快照合并规则保持一致，按属主节点 ID 字典序裁决
+            if (existing.getStateVersion() == version && existing.getOwnerNodeId() != null && ownerNodeId != null
+                    && existing.getOwnerNodeId().compareTo(ownerNodeId) > 0) {
+                log.debug("忽略版本相同的会话删除指令，客户端ID：{}，删除节点：{}，快照属主：{}",
+                        clientId, ownerNodeId, existing.getOwnerNodeId());
+                return;
+            }
+        }
+        if (version > 0) {
+            removedSnapshots.merge(clientId, new RemovedSnapshot(version, System.currentTimeMillis()),
+                    (left, right) -> right.version() >= left.version() ? right : left);
+        }
+        removeRemoteSnapshot(clientId);
+    }
+
+    /***
+    * 清理过期的远端会话删除墓碑，避免长期运行后墓碑无限增长。
+    * @author wcdk
+    * @param now 当前时间毫秒
+    ***/
+    public void purgeRemovedSnapshots(long now) {
+        removedSnapshots.entrySet().removeIf(entry -> now - entry.getValue().removedAt() > removedSnapshotTtlMillis);
     }
 
     /***
@@ -793,6 +974,8 @@ public class MqttSessionRegistry {
     ***/
     public void notifySessionChanged(MqttSession session) {
         if (session != null) {
+            // 状态变更先递增版本，保证对端按版本裁决时能识别本次变更
+            session.bumpStateVersion();
             // 订阅等状态变化先重建路由索引，再广播给集群（索引重建不依赖监听器存在）
             reindexSession(session);
         }
@@ -808,6 +991,8 @@ public class MqttSessionRegistry {
 
     private void notifySessionRemoved(MqttSession session) {
         if (session != null) {
+            // 删除事件同样携带递增版本，避免对端迟到快照覆盖删除结果
+            session.bumpStateVersion();
             removeFromRoutingIndex(session.clientId());
         }
         for (MqttSessionListener listener : sessionListenerSnapshot()) {

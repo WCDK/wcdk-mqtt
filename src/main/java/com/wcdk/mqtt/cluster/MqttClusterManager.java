@@ -1,10 +1,13 @@
 package com.wcdk.mqtt.cluster;
 
+import java.io.File;
 import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Base64;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -19,17 +22,22 @@ import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.Supplier;
 
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.wcdk.mqtt.config.MqttProperties;
 import com.wcdk.mqtt.core.MqttBrokerMessage;
+import com.wcdk.mqtt.core.MqttRetainedStore;
 import com.wcdk.mqtt.core.MqttSession;
 import com.wcdk.mqtt.core.MqttSessionListener;
 import com.wcdk.mqtt.core.MqttSessionRegistry;
 import com.wcdk.mqtt.core.MqttTopicMatcher;
 import io.netty.channel.ChannelOption;
+import io.netty.handler.ssl.ClientAuth;
+import io.netty.handler.ssl.SslContext;
+import io.netty.handler.ssl.SslContextBuilder;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.context.SmartLifecycle;
@@ -77,6 +85,15 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
     /** 出站负载构造/JSON 编码线程池，避免编码占用 MQTT 与集群事件循环 */
     private volatile ExecutorService outboundExecutor;
     private volatile boolean running;
+    /** 上一次记录的多数派状态，用于只在状态翻转时输出日志 */
+    private volatile boolean quorumAvailable = true;
+    /** 对等节点暂不可达时按节点暂存的发布消息，重连后补发，避免跨节点消息静默丢失 */
+    private final Map<String, Deque<MqttBrokerMessage>> pendingPeerPublishes = new ConcurrentHashMap<>();
+    /** 因缓冲容量不足丢弃的跨节点发布消息数 */
+    private final AtomicLong droppedClusterPublishes = new AtomicLong();
+    /** 集群服务端/客户端 TLS 上下文，未启用 TLS 时为空 */
+    private volatile SslContext clusterServerSslContext;
+    private volatile SslContext clusterClientSslContext;
 
     public MqttClusterManager(MqttProperties properties,
                               MqttSessionRegistry registry,
@@ -101,8 +118,13 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         }
         resolveNodeId();
         resolveAdvertisedAddress();
+        if (properties.getCluster().isRequireAuth() && clusterUsername() == null) {
+            throw new IllegalStateException("集群已启用但未配置认证凭据：请设置 wcdk.mqtt.cluster.username/password，"
+                    + "或在确认网络已隔离后显式设置 wcdk.mqtt.cluster.require-auth=false");
+        }
+        initTlsContexts();
         initClusterExecutors();
-        clusterServer.bind();
+        clusterServer.bind(clusterServerSslContext);
         // 单守护线程周期扫描未覆盖的对等地址并重拨
         scheduler = Executors.newSingleThreadScheduledExecutor(runnable -> {
             Thread thread = new Thread(runnable, "mqtt-cluster-redial");
@@ -114,8 +136,15 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         running = true;
         // 启动后立即执行一轮拨号，不等待首个周期
         redialSweep();
-        log.info("集群功能启动成功，节点ID：{}，集群端口：{}，公布地址：{}，对等节点数：{}",
-                nodeId, clusterServer.port(), advertisedAddress, properties.getCluster().getPeers().size());
+        int expected = expectedNodeCount();
+        if (properties.getCluster().isQuorumEnabled() && expected % 2 == 0) {
+            log.warn("集群固定成员数为偶数（{}），多数派阈值为 {}，任一节点离线即失去写能力，建议使用奇数成员",
+                    expected, quorumSize());
+        }
+        quorumAvailable = hasQuorum();
+        log.info("集群功能启动成功，节点ID：{}，集群端口：{}，公布地址：{}，对等节点数：{}，固定成员数：{}，多数派阈值：{}，当前可达：{}",
+                nodeId, clusterServer.port(), advertisedAddress, properties.getCluster().getPeers().size(),
+                expected, quorumSize(), reachableNodeCount());
     }
 
     /***
@@ -132,13 +161,66 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         }
         peers.values().forEach(MqttClusterPeer::close);
         peers.clear();
+        pendingPeerPublishes.clear();
         nodeStates.values().forEach(state -> state.setConnected(false));
         clusterServer.dispose();
+        clusterServerSslContext = null;
+        clusterClientSslContext = null;
         shutdownExecutor(inboundExecutor);
         inboundExecutor = null;
         shutdownExecutor(outboundExecutor);
         outboundExecutor = null;
         log.info("集群功能已停止");
+    }
+
+    /***
+    * 初始化集群通道 TLS 上下文：配置信任 CA 时服务端强制校验客户端证书，实现双向认证。
+    * 未启用 TLS 时两个上下文均为空，连接保持明文。
+    * @author wcdk
+    ***/
+    private void initTlsContexts() {
+        if (!properties.getCluster().isTlsEnabled()) {
+            return;
+        }
+        File certFile = requireSslFile(properties.getCluster().getTlsCertPath(), "tls-cert-path");
+        File keyFile = requireSslFile(properties.getCluster().getTlsKeyPath(), "tls-key-path");
+        String trustPath = properties.getCluster().getTlsTrustCertPath();
+        File trustFile = trustPath == null || trustPath.isBlank() ? null : requireSslFile(trustPath, "tls-trust-cert-path");
+        try {
+            SslContextBuilder serverBuilder = SslContextBuilder.forServer(certFile, keyFile);
+            if (trustFile != null) {
+                // 配置互信 CA 时要求客户端证书，防止任意节点接入集群端口
+                serverBuilder.trustManager(trustFile).clientAuth(ClientAuth.REQUIRE);
+            }
+            clusterServerSslContext = serverBuilder.build();
+            SslContextBuilder clientBuilder = SslContextBuilder.forClient()
+                    .keyManager(certFile, keyFile);
+            if (trustFile != null) {
+                clientBuilder.trustManager(trustFile);
+            }
+            clusterClientSslContext = clientBuilder.build();
+            log.info("集群通道 TLS 已启用，双向认证：{}", trustFile != null);
+        } catch (Exception ex) {
+            throw new IllegalStateException("集群通道 TLS 上下文初始化失败：" + ex.getMessage(), ex);
+        }
+    }
+
+    /***
+    * 校验 TLS 证书文件存在，缺失时快速失败避免以明文误启动。
+    * @author wcdk
+    * @param path 文件路径
+    * @param name 配置项名称
+    * @return 证书文件
+    ***/
+    private File requireSslFile(String path, String name) {
+        if (path == null || path.isBlank()) {
+            throw new IllegalStateException("集群通道已启用 TLS，但未配置 " + name);
+        }
+        File file = new File(path.trim());
+        if (!file.isFile()) {
+            throw new IllegalStateException("集群通道 TLS 文件不存在，配置项：" + name + "，路径：" + file.getAbsolutePath());
+        }
+        return file;
     }
 
     /***
@@ -218,6 +300,82 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
             }
         }
         return count;
+    }
+
+    /***
+    * 集群固定成员数（含本节点）。优先取配置的 expected-nodes，
+    * 未配置时按 peers 非空数量 + 1 计算，避免依赖动态发现结果。
+    * @author wcdk
+    * @return 固定成员数
+    ***/
+    public int expectedNodeCount() {
+        int configured = properties.getCluster().getExpectedNodes();
+        if (configured > 0) {
+            return configured;
+        }
+        int peers = 0;
+        List<String> addresses = properties.getCluster().getPeers();
+        if (addresses != null) {
+            for (String address : addresses) {
+                if (address != null && !address.isBlank()) {
+                    peers++;
+                }
+            }
+        }
+        return peers + 1;
+    }
+
+    /***
+    * 多数派阈值：固定成员数的过半加一。
+    * @author wcdk
+    * @return 多数派所需节点数
+    ***/
+    public int quorumSize() {
+        return expectedNodeCount() / 2 + 1;
+    }
+
+    /***
+    * 当前可达节点数（含本节点）。
+    * @author wcdk
+    * @return 可达节点数
+    ***/
+    public int reachableNodeCount() {
+        return connectedPeerCount() + 1;
+    }
+
+    /***
+    * 是否达成多数派。单实例或关闭集群、关闭多数派校验时恒为 true。
+    * @author wcdk
+    * @return 达成多数派返回 true
+    ***/
+    public boolean hasQuorum() {
+        if (!properties.getCluster().isEnabled() || !properties.getCluster().isQuorumEnabled()) {
+            return true;
+        }
+        return reachableNodeCount() >= quorumSize();
+    }
+
+    /***
+    * 重新计算多数派状态，仅在翻转时输出中文日志。
+    * @author wcdk
+    ***/
+    private void refreshQuorumState() {
+        if (!properties.getCluster().isEnabled() || !properties.getCluster().isQuorumEnabled()) {
+            quorumAvailable = true;
+            return;
+        }
+        boolean current = hasQuorum();
+        if (current == quorumAvailable) {
+            return;
+        }
+        quorumAvailable = current;
+        if (current) {
+            log.info("集群已恢复多数派，写能力恢复，可达节点：{}，多数派阈值：{}，固定成员数：{}",
+                    reachableNodeCount(), quorumSize(), expectedNodeCount());
+        } else {
+            log.warn("集群未达成多数派，本节点进入只读模式，拒绝新连接与持久写入，可达节点：{}，多数派阈值：{}，固定成员数：{}",
+                    reachableNodeCount(), quorumSize(), expectedNodeCount());
+        }
     }
 
     /***
@@ -474,6 +632,9 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         });
         log.info("集群节点已连接，节点ID：{}，地址：{}，本方主动拨号：{}",
                 remoteNodeId, peer.advertisedAddress(), peer.isDialed());
+        refreshQuorumState();
+        // 补发该节点断连期间积压的发布消息
+        flushPendingPublishes(peer);
         return true;
     }
 
@@ -493,6 +654,7 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
             state.setConnected(false);
         }
         log.info("集群节点连接断开，节点ID：{}", remoteNodeId);
+        refreshQuorumState();
     }
 
     /***
@@ -501,13 +663,13 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
     * @param peer 对等连接
     ***/
     private void sendStateSync(MqttClusterPeer peer) {
-        List<MqttBrokerMessage> retained = registry.retainedStore().findAll();
+        List<MqttRetainedStore.RetainedEntry> retained = registry.retainedStore().entries();
         int retainedBatches = 0;
         for (int from = 0; from < retained.size(); from += STATE_SYNC_BATCH_SIZE) {
             int to = Math.min(from + STATE_SYNC_BATCH_SIZE, retained.size());
             List<Map<String, Object>> items = new ArrayList<>(to - from);
-            for (MqttBrokerMessage message : retained.subList(from, to)) {
-                items.add(messagePayload(message));
+            for (MqttRetainedStore.RetainedEntry entry : retained.subList(from, to)) {
+                items.add(messagePayload(entry.message(), entry.version()));
             }
             if (!peer.send(ClusterEventType.RETAINED_SYNC, Map.of("messages", items))) {
                 log.debug("保留消息同步中止，远端节点：{}", peer.remoteNodeId());
@@ -554,7 +716,28 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         if (!MqttTopicMatcher.isValidTopicName(message.topic())) {
             return;
         }
-        registry.deliver(message);
+        Long retainedVersion = parseVersion(payload.get("retainedVersion"));
+        registry.deliver(message, retainedVersion);
+    }
+
+    /***
+    * 解析事件负载中的版本号，缺失或非法时返回 null。
+    * @author wcdk
+    * @param value 负载值
+    * @return 版本号或 null
+    ***/
+    private static Long parseVersion(Object value) {
+        if (value instanceof Number number) {
+            return number.longValue();
+        }
+        if (value instanceof String text) {
+            try {
+                return Long.parseLong(text.trim());
+            } catch (NumberFormatException ex) {
+                return null;
+            }
+        }
+        return null;
     }
 
     /***
@@ -688,9 +871,14 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
     ***/
     private void handleSessionRemove(Map<String, Object> payload) {
         Object clientIdValue = payload.get("clientId");
-        if (clientIdValue != null) {
-            registry.removeRemoteSnapshot(clientIdValue.toString());
+        if (clientIdValue == null) {
+            return;
         }
+        Long version = parseVersion(payload.get("version"));
+        Object ownerNodeId = payload.get("ownerNodeId");
+        registry.removeRemoteSnapshot(clientIdValue.toString(),
+                version == null ? 0L : version,
+                ownerNodeId == null ? null : ownerNodeId.toString());
     }
 
     /***
@@ -720,14 +908,17 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         if (!(messagesValue instanceof List<?> items)) {
             return;
         }
-        List<MqttBrokerMessage> merged = new ArrayList<>();
+        List<MqttRetainedStore.RetainedEntry> merged = new ArrayList<>();
         for (Object item : items) {
-            MqttBrokerMessage message = decodeMessage(objectMapper.convertValue(item,
+            Map<String, Object> map = objectMapper.convertValue(item,
                     new TypeReference<LinkedHashMap<String, Object>>() {
-                    }));
-            if (message != null) {
-                merged.add(message);
+                    });
+            MqttBrokerMessage message = decodeMessage(map);
+            if (message == null) {
+                continue;
             }
+            Long version = parseVersion(map.get("retainedVersion"));
+            merged.add(new MqttRetainedStore.RetainedEntry(message, version == null ? 0L : version));
         }
         registry.retainedStore().merge(merged);
     }
@@ -750,11 +941,97 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         Supplier<Map<String, Object>> payload = new LazyPayloadSupplier(() -> messagePayload(message));
         for (String targetNodeId : targetNodes) {
             MqttClusterPeer peer = peers.get(targetNodeId);
-            if (peer == null || peer.isClosed()) {
-                continue;
+            if (peer == null || peer.isClosed() || !peer.send(ClusterEventType.PUBLISH, payload)) {
+                // 节点断开或出站队列已满：暂存到该节点缓冲，重连后补发，避免消息静默丢失
+                bufferPendingPublish(targetNodeId, message);
             }
-            peer.send(ClusterEventType.PUBLISH, payload);
         }
+    }
+
+    /***
+    * 暂存节点不可达期间的跨节点发布，缓冲区满时丢弃最旧消息并累计告警。
+    * @author wcdk
+    * @param nodeId 目标节点 ID
+    * @param message 发布消息
+    ***/
+    void bufferPendingPublish(String nodeId, MqttBrokerMessage message) {
+        if (nodeId == null || message == null) {
+            return;
+        }
+        int capacity = Math.max(16, properties.getCluster().getEventQueueCapacity());
+        Deque<MqttBrokerMessage> queue = pendingPeerPublishes.computeIfAbsent(nodeId, key -> new ArrayDeque<>());
+        synchronized (queue) {
+            while (queue.size() >= capacity) {
+                queue.pollFirst();
+                long dropped = droppedClusterPublishes.incrementAndGet();
+                if (dropped == 1 || dropped % 1000 == 0) {
+                    log.warn("跨节点发布缓冲已满，丢弃最旧消息，目标节点：{}，累计丢弃：{}，缓冲上限：{}",
+                            nodeId, dropped, capacity);
+                }
+            }
+            queue.addLast(message);
+        }
+    }
+
+    /***
+    * 节点重连后补发断连期间积压的跨节点发布；补发失败时保留剩余消息等待下次重连。
+    * @author wcdk
+    * @param peer 已登记的对等连接
+    ***/
+    private void flushPendingPublishes(MqttClusterPeer peer) {
+        String nodeId = peer.remoteNodeId();
+        if (nodeId == null) {
+            return;
+        }
+        Deque<MqttBrokerMessage> queue = pendingPeerPublishes.get(nodeId);
+        if (queue == null) {
+            return;
+        }
+        int sent = 0;
+        synchronized (queue) {
+            while (!peer.isClosed()) {
+                MqttBrokerMessage message = queue.peekFirst();
+                if (message == null) {
+                    break;
+                }
+                if (!peer.send(ClusterEventType.PUBLISH,
+                        new LazyPayloadSupplier(() -> messagePayload(message)))) {
+                    break;
+                }
+                queue.pollFirst();
+                sent++;
+            }
+            if (queue.isEmpty()) {
+                pendingPeerPublishes.remove(nodeId, queue);
+            }
+        }
+        if (sent > 0) {
+            log.info("已补发节点断连期间积压的跨节点消息，节点ID：{}，数量：{}", nodeId, sent);
+        }
+    }
+
+    /***
+    * 当前各节点待补发的跨节点消息总数，供控制台观测。
+    * @author wcdk
+    * @return 待补发消息数
+    ***/
+    public int pendingPeerPublishCount() {
+        int total = 0;
+        for (Deque<MqttBrokerMessage> queue : pendingPeerPublishes.values()) {
+            synchronized (queue) {
+                total += queue.size();
+            }
+        }
+        return total;
+    }
+
+    /***
+    * 累计因缓冲满丢弃的跨节点消息数，供控制台观测。
+    * @author wcdk
+    * @return 丢弃消息数
+    ***/
+    public long droppedClusterPublishCount() {
+        return droppedClusterPublishes.get();
     }
 
     /***
@@ -778,7 +1055,10 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         if (ownerNodeId != null) {
             MqttClusterPeer owner = peers.get(ownerNodeId);
             if (owner != null && !owner.isClosed()) {
-                return owner.send(ClusterEventType.PUBLISH, payload);
+                if (owner.send(ClusterEventType.PUBLISH, payload)) {
+                    return true;
+                }
+                log.warn("跨节点点对点转发失败，目标客户端：{}，属主节点：{}", clientId, ownerNodeId);
             }
             return false;
         }
@@ -855,7 +1135,13 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
         if (!running) {
             return;
         }
-        Map<String, Object> payload = Map.of("clientId", session.clientId());
+        Map<String, Object> payload = new LinkedHashMap<>();
+        payload.put("clientId", session.clientId());
+        // 携带删除版本，接收方据此丢弃迟到的旧快照
+        payload.put("version", session.stateVersion());
+        if (session.ownerNodeId() != null) {
+            payload.put("ownerNodeId", session.ownerNodeId());
+        }
         for (MqttClusterPeer peer : peers.values()) {
             peer.send(ClusterEventType.SESSION_REMOVE, payload);
         }
@@ -967,11 +1253,15 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
             return;
         }
         try {
-            TcpClient.create()
+            TcpClient client = TcpClient.create()
                     .host(host)
                     .port(port)
-                    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 3000)
-                    .handle((inbound, outbound) -> wire(inbound, outbound, true, address))
+                    .option(ChannelOption.CONNECT_TIMEOUT_MILLIS, 3000);
+            SslContext clientSsl = clusterClientSslContext;
+            if (clientSsl != null) {
+                client = client.secure(spec -> spec.sslContext(clientSsl));
+            }
+            client.handle((inbound, outbound) -> wire(inbound, outbound, true, address))
                     .connectNow(java.time.Duration.ofSeconds(5));
             log.info("已发起集群拨号，目标地址：{}", address);
         } catch (RuntimeException ex) {
@@ -986,12 +1276,28 @@ public class MqttClusterManager implements SmartLifecycle, MqttSessionListener {
     * @return 负载 Map
     ***/
     private Map<String, Object> messagePayload(MqttBrokerMessage message) {
+        // 保留消息携带本地已分配的版本，接收方按版本合并而不是按到达顺序覆盖
+        long retainedVersion = message.retained() ? registry.retainedStore().versionOf(message.topic()) : 0L;
+        return messagePayload(message, retainedVersion);
+    }
+
+    /***
+    * 构造消息事件负载，保留消息附带对账版本。
+    * @author wcdk
+    * @param message 消息
+    * @param retainedVersion 保留消息版本，非正数表示不携带
+    * @return 负载 Map
+    ***/
+    private Map<String, Object> messagePayload(MqttBrokerMessage message, long retainedVersion) {
         Map<String, Object> payload = new LinkedHashMap<>();
         payload.put("messageId", message.messageId());
         payload.put("topic", message.topic());
         payload.put("payload", Base64.getEncoder().encodeToString(message.payload()));
         payload.put("qos", message.qos());
         payload.put("retained", message.retained());
+        if (retainedVersion > 0) {
+            payload.put("retainedVersion", retainedVersion);
+        }
         return payload;
     }
 

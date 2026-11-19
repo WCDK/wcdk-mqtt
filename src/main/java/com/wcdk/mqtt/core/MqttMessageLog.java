@@ -109,13 +109,16 @@ public class MqttMessageLog implements MqttPublishListener {
     ***/
     public List<LoggedMessage> query(String topicFilter, Integer qos, Instant from, Instant to, int limit) {
         int resultLimit = Math.max(1, Math.min(limit, capacity));
+        // 仅在锁内复制，过滤与排序在锁外执行，避免控制台查询阻塞消息写入
+        List<LoggedMessage> snapshot;
         synchronized (messages) {
-            return messages.stream()
-                    .filter(message -> matches(message, topicFilter, qos, from, to))
-                    .sorted(Comparator.comparing(LoggedMessage::receivedAt).reversed())
-                    .limit(resultLimit)
-                    .toList();
+            snapshot = new ArrayList<>(messages);
         }
+        return snapshot.stream()
+                .filter(message -> matches(message, topicFilter, qos, from, to))
+                .sorted(Comparator.comparing(LoggedMessage::receivedAt).reversed())
+                .limit(resultLimit)
+                .toList();
     }
 
     /***

@@ -54,6 +54,12 @@ services:
       WCDK_MQTT_CLUSTER_ADVERTISE_HOST: mqtt-node1
       WCDK_MQTT_CLUSTER_PEERS_0: mqtt-node2:28883
       WCDK_MQTT_CLUSTER_PEERS_1: mqtt-node3:28883
+      # 集群通道认证：默认强制配置，生产环境务必改为高强度随机值并与其余节点保持一致
+      WCDK_MQTT_CLUSTER_USERNAME: wcdk-cluster
+      WCDK_MQTT_CLUSTER_PASSWORD: change-me-cluster-secret
+      # 固定三节点成员数：分区时按 2/3 多数派裁决，少数派只读
+      WCDK_MQTT_CLUSTER_EXPECTED_NODES: "3"
+      WCDK_MQTT_CLUSTER_QUORUM_ENABLED: "true"
 
   mqtt-node2:
     build: .
@@ -76,6 +82,10 @@ services:
       WCDK_MQTT_CLUSTER_ADVERTISE_HOST: mqtt-node2
       WCDK_MQTT_CLUSTER_PEERS_0: mqtt-node1:28883
       WCDK_MQTT_CLUSTER_PEERS_1: mqtt-node3:28883
+      WCDK_MQTT_CLUSTER_USERNAME: wcdk-cluster
+      WCDK_MQTT_CLUSTER_PASSWORD: change-me-cluster-secret
+      WCDK_MQTT_CLUSTER_EXPECTED_NODES: "3"
+      WCDK_MQTT_CLUSTER_QUORUM_ENABLED: "true"
 
   mqtt-node3:
     build: .
@@ -98,3 +108,7 @@ services:
       WCDK_MQTT_CLUSTER_ADVERTISE_HOST: mqtt-node3
       WCDK_MQTT_CLUSTER_PEERS_0: mqtt-node1:28883
       WCDK_MQTT_CLUSTER_PEERS_1: mqtt-node2:28883
+      WCDK_MQTT_CLUSTER_USERNAME: wcdk-cluster
+      WCDK_MQTT_CLUSTER_PASSWORD: change-me-cluster-secret
+      WCDK_MQTT_CLUSTER_EXPECTED_NODES: "3"
+      WCDK_MQTT_CLUSTER_QUORUM_ENABLED: "true"

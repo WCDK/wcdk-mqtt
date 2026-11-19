@@ -42,6 +42,16 @@ public class ClusterController {
             data.put("bindPort", properties.getCluster().getBindPort());
             data.put("connectedPeers", clusterManager.connectedPeerCount());
             data.put("configuredPeers", properties.getCluster().getPeers());
+            data.put("quorumEnabled", properties.getCluster().isQuorumEnabled());
+            data.put("expectedNodes", clusterManager.expectedNodeCount());
+            data.put("quorumSize", clusterManager.quorumSize());
+            data.put("reachableNodes", clusterManager.reachableNodeCount());
+            data.put("hasQuorum", clusterManager.hasQuorum());
+            data.put("readOnly", !clusterManager.hasQuorum());
+            data.put("pendingPublishes", clusterManager.pendingPeerPublishCount());
+            data.put("droppedPublishes", clusterManager.droppedClusterPublishCount());
+            data.put("requireAuth", properties.getCluster().isRequireAuth());
+            data.put("tlsEnabled", properties.getCluster().isTlsEnabled());
             data.put("nodes", clusterManager.nodes());
             return ApiResponse.ok(data);
         });

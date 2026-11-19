@@ -3,6 +3,7 @@ package com.wcdk.mqtt.protocol;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
+import java.util.concurrent.locks.LockSupport;
 
 import com.wcdk.mqtt.config.MqttProperties;
 import com.wcdk.mqtt.core.MqttBrokerMessage;
@@ -69,6 +70,8 @@ public class MqttClientConnection implements MqttConnectionHandle {
     private final String remoteAddress;
     /** 出站汇聚点：有界缓冲，防止慢消费者拖垮堆内存 */
     private final Sinks.Many<MqttMessage> outboundSink;
+    /** 出站单写者锁：unicast Sink 不保证多生产者线程安全 */
+    private final Object outboundLock = new Object();
 
     /** 当前绑定的会话，CONNECT 成功后非空 */
     private volatile MqttSession session;
@@ -119,7 +122,7 @@ public class MqttClientConnection implements MqttConnectionHandle {
                 .doOnNext(this::handleMessage)
                 .doFinally(signalType -> {
                     // 入站结束后完成出站汇聚点，让待刷报文写完后再关连接
-                    outboundSink.tryEmitComplete();
+                    completeOutbound();
                     cleanup();
                 })
                 .then();
@@ -185,6 +188,14 @@ public class MqttClientConnection implements MqttConnectionHandle {
             return;
         }
         this.protocolLevel = variableHeader.version();
+        // 多数派闸门：未达成多数派时拒绝新连接，避免少数派继续接纳客户端造成脑裂
+        if (!brokerService.hasQuorum()) {
+            log.warn("集群未达成多数派，拒绝新客户端连接，协议级别：{}，远端地址：{}",
+                    protocolLevel, remoteAddress);
+            sendConnAck(unavailableReturnCode(), false);
+            completeOutboundAndClose();
+            return;
+        }
         // MQTT5 会话过期秒数：缺省 0（断开即结束会话），0xFFFFFFFF 归一化为永不过期；
         // 旧协议无此概念，持久会话沿用不过期语义
         long sessionExpirySeconds = protocolLevel >= 5
@@ -367,6 +378,33 @@ public class MqttClientConnection implements MqttConnectionHandle {
             return;
         }
 
+        // 多数派闸门：少数派不允许持久写入。QoS0 直接丢弃；QoS>0 时 v5 回原因码，v3 断开连接
+        if (!brokerService.hasQuorum()) {
+            if (qos == 0) {
+                log.warn("集群未达成多数派，丢弃 QoS0 发布，客户端ID：{}，主题：{}，保留：{}",
+                        current.clientId(), topic, retained);
+                return;
+            }
+            if (protocolLevel >= 5) {
+                log.warn("集群未达成多数派，拒绝发布，客户端ID：{}，主题：{}，QoS：{}，保留：{}",
+                        current.clientId(), topic, qos, retained);
+                if (qos == 1) {
+                    ackPublish(1, packetId, (byte) 0x97);
+                } else {
+                    // QoS2 以 PUBREC 拒绝，客户端不应再发送 PUBREL
+                    emit(new MqttMessage(new MqttFixedHeader(
+                            io.netty.handler.codec.mqtt.MqttMessageType.PUBREC, false,
+                            MqttQoS.AT_LEAST_ONCE, false, 0),
+                            new MqttPubReplyMessageVariableHeader(packetId, (byte) 0x97, NO_PROPERTIES)));
+                }
+            } else {
+                log.warn("集群未达成多数派，旧版协议无法回原因码，断开连接，客户端ID：{}，主题：{}，QoS：{}",
+                        current.clientId(), topic, qos);
+                close();
+            }
+            return;
+        }
+
         // 访问控制：拒绝时仍按 QoS 回执，避免客户端无限重传
         if (!registry.acl().canPublish(current.username(), current.clientId(), topic)) {
             log.warn("客户端发布被访问控制拒绝，客户端ID：{}，主题：{}", current.clientId(), topic);
@@ -489,13 +527,21 @@ public class MqttClientConnection implements MqttConnectionHandle {
             return;
         }
         MqttBrokerMessage stored = current.removeInboundQos2(header.messageId());
+        boolean rejectedByQuorum = stored != null && !brokerService.hasQuorum();
+        if (rejectedByQuorum) {
+            // 多数派闸门：QoS2 第二阶段同样拒绝写入，避免少数派通过延迟确认绕过限制
+            log.warn("集群未达成多数派，丢弃 QoS2 发布，客户端ID：{}，主题：{}",
+                    current.clientId(), stored.topic());
+            stored = null;
+        }
         if (stored != null) {
             brokerService.publish(stored);
         }
+        byte reasonCode = rejectedByQuorum && protocolLevel >= 5 ? (byte) 0x97 : (byte) 0;
         emit(new MqttMessage(new MqttFixedHeader(
                 io.netty.handler.codec.mqtt.MqttMessageType.PUBCOMP, false,
                 MqttQoS.AT_MOST_ONCE, false, 0),
-                new MqttPubReplyMessageVariableHeader(header.messageId(), (byte) 0, NO_PROPERTIES)));
+                new MqttPubReplyMessageVariableHeader(header.messageId(), reasonCode, NO_PROPERTIES)));
     }
 
     /***
@@ -655,7 +701,7 @@ public class MqttClientConnection implements MqttConnectionHandle {
         log.info("客户端正常断开连接，客户端ID：{}，远端地址：{}",
                 current == null ? null : current.clientId(), remoteAddress);
         // 完成出站汇聚点，刷完剩余报文后由写链路关闭连接
-        outboundSink.tryEmitComplete();
+        completeOutbound();
     }
 
     /***
@@ -685,6 +731,17 @@ public class MqttClientConnection implements MqttConnectionHandle {
                 .sessionPresent(sessionPresent)
                 .properties(NO_PROPERTIES)
                 .build());
+    }
+
+    /***
+    * 少数派拒绝新连接时使用的原因码：MQTT5 返回服务端繁忙，旧协议返回服务不可用。
+    * @author wcdk
+    * @return CONNACK 返回码
+    ***/
+    private MqttConnectReturnCode unavailableReturnCode() {
+        return protocolLevel >= 5
+                ? MqttConnectReturnCode.CONNECTION_REFUSED_SERVER_BUSY
+                : MqttConnectReturnCode.CONNECTION_REFUSED_SERVER_UNAVAILABLE;
     }
 
     /***
@@ -775,11 +832,15 @@ public class MqttClientConnection implements MqttConnectionHandle {
         if (closed) {
             return false;
         }
-        Sinks.EmitResult result = outboundSink.tryEmitNext(message);
-        // 序列化包装被其他线程短暂持锁时重试，避免报文因并发竞争被丢弃
-        for (int attempt = 0; attempt < 3 && result == Sinks.EmitResult.FAIL_NON_SERIALIZED; attempt++) {
-            Thread.yield();
+        Sinks.EmitResult result;
+        // 单写者串行化：unicast Sink 在多生产者并发写入时会返回 FAIL_NON_SERIALIZED 并可能丢包
+        synchronized (outboundLock) {
             result = outboundSink.tryEmitNext(message);
+            // 串行化后仍偶发非序列化失败时短让 CPU，避免 Thread.yield 忙等污染事件循环
+            for (int attempt = 0; attempt < 3 && result == Sinks.EmitResult.FAIL_NON_SERIALIZED; attempt++) {
+                LockSupport.parkNanos(50_000L);
+                result = outboundSink.tryEmitNext(message);
+            }
         }
         if (result == Sinks.EmitResult.FAIL_OVERFLOW) {
             log.warn("客户端出站缓冲写满，判定为慢消费者并断开，远端地址：{}，缓冲上限：{}条",
@@ -805,7 +866,17 @@ public class MqttClientConnection implements MqttConnectionHandle {
     * @author wcdk
     ***/
     private void completeOutboundAndClose() {
-        outboundSink.tryEmitComplete();
+        completeOutbound();
+    }
+
+    /***
+    * 在单写者锁内完成出站汇聚，避免与并发写入竞争导致完成信号丢失。
+    * @author wcdk
+    ***/
+    private void completeOutbound() {
+        synchronized (outboundLock) {
+            outboundSink.tryEmitComplete();
+        }
     }
 
     /***

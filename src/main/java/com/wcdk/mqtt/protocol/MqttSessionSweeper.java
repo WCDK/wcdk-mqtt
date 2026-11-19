@@ -52,6 +52,10 @@ public class MqttSessionSweeper {
                 log.info("MQTT5 会话已过期并移除，客户端ID：{}，会话过期：{}秒",
                         session.clientId(), session.sessionExpirySeconds());
             }
+            // 清理过期的保留消息删除墓碑与会话删除墓碑，避免长期运行后无限增长
+            long now = System.currentTimeMillis();
+            registry.retainedStore().purgeExpiredTombstones(now);
+            registry.purgeRemovedSnapshots(now);
         } catch (RuntimeException ex) {
             log.warn("会话巡检执行异常，异常信息：{}", ex.getMessage());
         }

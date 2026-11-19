@@ -5,6 +5,7 @@ import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.concurrent.Executor;
+import java.util.concurrent.locks.LockSupport;
 import java.util.function.Supplier;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -54,6 +55,9 @@ public class MqttClusterPeer {
     /** 是否已关闭 */
     @Getter
     private volatile boolean closed;
+    /** 关闭标志，保证 close 与 markClosed 并发时只执行一次资源释放 */
+    private final java.util.concurrent.atomic.AtomicBoolean closing =
+            new java.util.concurrent.atomic.AtomicBoolean();
     /**
      * 出站写入串行化锁：unicast Sink 不保证多生产者线程安全，
      * 心跳、发布、会话同步、管理指令可能来自不同执行体，必须单写者化。
@@ -193,9 +197,9 @@ public class MqttClusterPeer {
                 return;
             }
             Sinks.EmitResult result = outboundSink.tryEmitNext(buffer);
-            // 串行化后仍偶发非序列化失败时短暂重试，避免事件因竞争被丢弃
+            // 串行化后仍偶发非序列化失败时短暂让出 CPU，避免 Thread.yield 忙等污染事件循环
             for (int attempt = 0; attempt < 10 && result == Sinks.EmitResult.FAIL_NON_SERIALIZED; attempt++) {
-                Thread.yield();
+                LockSupport.parkNanos(50_000L);
                 result = outboundSink.tryEmitNext(buffer);
             }
             if (result.isSuccess()) {
@@ -259,7 +263,7 @@ public class MqttClusterPeer {
     * @author wcdk
     ***/
     public void close() {
-        if (closed) {
+        if (!closing.compareAndSet(false, true)) {
             return;
         }
         closed = true;
@@ -276,6 +280,9 @@ public class MqttClusterPeer {
     * @author wcdk
     ***/
     void markClosed() {
+        if (!closing.compareAndSet(false, true)) {
+            return;
+        }
         this.closed = true;
         outboundQueue.close();
     }
