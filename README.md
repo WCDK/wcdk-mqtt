@@ -583,9 +583,6 @@ src/test/java/com/wcdk/mqtt   单元测试与集成测试
 ## 相关文档
 
 - [Docker 部署指南](docker.md)
-- [并发安全评估与修复记录](CONCURRENCY-ASSESSMENT.md)
-- [9 万连接容量评估](CAPACITY-ASSESSMENT-90K.md)
-
 ---
 
 ## License
